@@ -1,0 +1,32 @@
+# --- secrets / local state -------------------------------------------------
+*.local
+.secrets
+.env
+
+# --- model artifacts (never committed) -------------------------------------
+models/
+*.gguf
+packs/
+/mtp/
+
+# --- Strata-generated files -------------------------------------------------
+strata-*.json
+strata-*.log
+strata-tui.log
+run-*.bat
+run-*.sh
+engine/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# --- backups ----------------------------------------------------------------
+*.bak
+*.bak-*
+
+# --- editor / OS ------------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
