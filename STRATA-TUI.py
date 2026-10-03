@@ -85,6 +85,9 @@ GREEN = "\x1b[92m"
 YELLOW = "\x1b[93m"
 RED = "\x1b[91m"
 CYAN = "\x1b[96m"
+GRAY = "\x1b[90m"
+SPINNER = "|/-\\"          # ASCII spinner: renders everywhere
+SPINNER_SECONDS = 0.25   # status-bar animation while an operation runs
 
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1030,11 @@ class LogView:
             new = True
         return new
 
+    def note(self, text: str):
+        """Insert one synthesized line into the visible log (page-local, never
+        written to the file) - e.g. the MODEL READY banner."""
+        self.lines.append(text)
+
 
 def clip_line(s: str, width: int) -> str:
     if width <= 8:
@@ -1034,55 +1042,167 @@ def clip_line(s: str, width: int) -> str:
     return s if len(s) <= width else s[:width - 1] + "…"
 
 
-def log_frame(status: str, lines) -> str:
+def _short(s, n: int) -> str:
+    s = str(s or "")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _pad(s: str, width: int) -> str:
+    """Pad a possibly-ANSI row to the full width so a shorter frame can never
+    leave ghosting from an earlier, longer one."""
+    return s + " " * max(0, width - len(ANSI_RE.sub("", s)))
+
+
+# (kind, label, port) -> status-bar color
+STATUS_STYLE = {
+    "LOADING": YELLOW,
+    "RUNNING": GREEN,
+    "PREPARING": CYAN,
+    "STOPPING": YELLOW,
+    "STOPPED": GREEN,
+    "PREPARED": GREEN,
+    "ERROR": RED,
+    "DONE": GREEN,
+}
+
+
+def _status_text(state, spinner: str | None, width: int) -> str:
+    """The plain status-bar text: LOADING/RUNNING/PREPARING/STOPPING/..."""
+    kind, label, port = state
+    label = _short(label, 48)
+    if kind == "LOADING":
+        return f"LOADING · {label} · :{port} · {spinner}"
+    if kind == "RUNNING":
+        return f"RUNNING · {label} · :{port} · READY"
+    if kind == "PREPARING":
+        return f"PREPARING · {label} · {spinner}"
+    if kind == "STOPPING":
+        return f"STOPPING · {label} · {spinner}"
+    if kind == "STOPPED":
+        return f"STOPPED · {label}"
+    if kind == "PREPARED":
+        return f"PREPARED · {label}"
+    if kind == "DONE":
+        return f"DONE · {label}"
+    return f"ERROR · {_short(label, width - 8)}"
+
+
+def _finish_record(state) -> str | None:
+    """One short line recorded in the log when an operation changes state."""
+    kind, label, port = state
+    if kind == "RUNNING":
+        return f"ready: http://127.0.0.1:{port}/v1"
+    if kind == "PREPARED":
+        return "prepare finished."
+    if kind == "STOPPED":
+        return "stopped."
+    if kind == "ERROR":
+        return f"error: {label}"
+    return f"{kind.lower()}: {label}"
+
+
+def build_log_frame(state, lines, tick: int, busy: bool, hint: str | None,
+                    running: bool) -> str:
+    """One log-page frame:
+      row 1  status bar (fixed, always on top)
+      row 2  dim separator
+      row 3  (busy only) one dim note, e.g. the long-prepare hint
+      ...    log tail, auto-scrolled to the newest output
+      last   one dim key-hint line (C / M greyed out when not running)
+    """
     width = max(60, min(150, shutil.get_terminal_size((120, 40)).columns - 2))
-    visible = list(lines)[-max(20, shutil.get_terminal_size((120, 40)).lines - 9):]
-    body = [BOLD + "STRATA LOG" + RESET, "", CYAN + status + RESET, ""]
+    rows = max(12, shutil.get_terminal_size((120, 40)).lines - 1)
+    kind, label, _port = state
+
+    spinner = SPINNER[tick % len(SPINNER)] if busy else None
+    color = STATUS_STYLE.get(kind, "")
+    out = [_pad(color + BOLD + _status_text(state, spinner, width) + RESET, width),
+           _pad(DIM + "─" * width + RESET, width)]
+    if hint and busy:
+        out.append(_pad(GRAY + "  " + hint + RESET, width))
+
+    log_rows = rows - len(out) - 2            # minus the blank row and the keys line
+    visible = list(lines)[-max(log_rows, 1):]
     if visible:
-        body.extend(clip_line(line, width) for line in visible)
+        out.extend(_pad(clip_line(line, width), width) for line in visible)
+    elif kind == "ERROR" and label:
+        out.append(DIM + "  " + _short(label, width) + RESET)
     else:
-        body.append(DIM + "(no output yet)" + RESET)
-    body += ["", DIM + "─" * min(88, width) + RESET,
-             "", "B / Esc  Back", "R        Refresh"]
-    return "\n".join(body) + "\n"
+        out.append(DIM + "(no output yet)" + RESET)
+
+    keys = "[B/Esc] Back   [R] Refresh   "
+    keys += (
+        "[C] Chat   [M] Monitor"
+        if running else
+        GRAY + "[C] Chat   [M] Monitor" + RESET
+    )
+    out += ["", _pad(DIM + keys + RESET, width)]
+    return "\n".join(out) + "\n"
 
 
-def log_page(status: str, sources=(LOG_FILE,), active=None, finished=None,
-             record_finished: bool = True):
-    """Operation output view.  `active` is a callable that is True while the
-    operation runs; `finished` produces the final status line.  Auto-updates
-    stop the moment the operation finishes; B / Esc returns to the menu."""
+def log_page(kind: str, label: str = "", port=None, sources=(LOG_FILE,),
+             active=None, finished=None, record_finished: bool = True,
+             banner: str | None = None, hint: str | None = None):
+    """Operation log page: fixed status bar on top, log tail in the middle,
+    one dim key hint at the bottom.
+
+    `state` is (kind, label, port); kind is one of LOADING / RUNNING /
+    PREPARING / STOPPING / STOPPED / PREPARED / ERROR / DONE.  While `active`
+    (a callable) is True the status bar shows a spinner and the page repaints
+    only when the spinner or the log changed - never faster than needed.
+    `finished()` returns the ending state; `banner` is shown once in the log
+    when the state turns RUNNING; `hint` is one dim line shown while active.
+    B / Esc returns; C / M open Chat / Monitor once the model is RUNNING.
+    """
     request_clear()
     view = LogView(sources)
-    last_status = None
-    last_lines = None
-    force = True
+    state = (kind, label, port)
+    tick = 0
+    last_frame = None
+    force = False
+    banner_done = False
 
     while True:
         if active is not None and not active():
             end = finished() if callable(finished) else finished
-            if end is None:
-                end = status
-            if record_finished and end:
-                append_log(end)
-            status = end
+            if end:
+                if isinstance(end, str):
+                    end = ("DONE", str(end), None)
+                else:
+                    end = tuple(end)
+                state = (end + (None,) * 3)[:3]
+                if record_finished:
+                    rec = _finish_record(state)
+                    if rec:
+                        append_log(rec)
             active = None
 
-        changed = view.read()
-        animate = active is not None and (changed or force)
-        if animate or status != last_status:
-            last_status = status
-            last_lines = list(view.lines)
-            paint(log_frame(status, last_lines))
+        view.read()
+        if state[0] == "RUNNING" and banner and not banner_done:
+            view.note(banner)
+            banner_done = True
+        tick += 1
+        busy = active is not None
+        frame = build_log_frame(
+            state, view.lines, tick, busy,
+            hint=hint if busy else None,
+            running=(state[0] == "RUNNING"),
+        )
+        if force or frame != last_frame:
+            paint(frame)
+            last_frame = frame
             force = False
 
-        key = read_key(0.5 if active is not None else None)
+        key = read_key(SPINNER_SECONDS if busy else None)
         if key in ("b", "esc"):
             request_clear()                     # the menu clears once on return
             return
         if key == "r":
             force = True
-            last_status = None
+        elif key == "c" and state[0] == "RUNNING" and state[2]:
+            webbrowser.open(f"http://127.0.0.1:{state[2]}/#chat")
+        elif key == "m" and state[0] == "RUNNING" and state[2]:
+            webbrowser.open(f"http://127.0.0.1:{state[2]}/#monitor")
 
 
 # ---------------------------------------------------------------------------
@@ -1197,6 +1317,8 @@ def main():
             item = items[pos]
             request_clear()
             if item.kind == "config" and item.status == "READY":
+                model_name = item.cfg.get("model_name") or item.path.stem
+                port = cfg_port(item.cfg)
                 started = start_item(item)
                 if started:
                     process, port = started
@@ -1204,34 +1326,45 @@ def main():
                     engine_log = Path(cfg["log"]) if cfg.get("log") else None
                     sources = [LOG_FILE] + ([engine_log] if engine_log else [])
                     log_page(
-                        f"Starting {item.title}…",
+                        "LOADING", model_name, port,
                         sources=sources,
                         active=lambda: process.poll() is None and health(port) is None,
                         finished=lambda: (
-                            f"Ready: http://127.0.0.1:{port}/v1"
+                            ("RUNNING", model_name, port)
                             if health(port) else
-                            f"Start process exited before becoming ready (exit {process.poll()})."
+                            ("ERROR", f"start exited ({process.poll()}) while loading - see the log", port)
                         ),
+                        banner=f"==== MODEL READY: http://127.0.0.1:{port} ====",
                     )
                 else:
-                    log_page("Start did not begin.", sources=[LOG_FILE])
+                    if health(port):
+                        log_page("RUNNING", model_name, port, sources=[LOG_FILE],
+                                 banner=f"==== MODEL READY: http://127.0.0.1:{port} ====")
+                    else:
+                        log_page("ERROR", "start did not begin - see the log above", port,
+                                 sources=[LOG_FILE])
             elif item.status == "PREPARE":
                 process = prepare(item)
                 if process:
+                    pname = item.model or item.title
+                    if item.variant:
+                        pname = f"{pname} · {item.variant}"
                     log_page(
-                        f"Preparing {item.title}…",
+                        "PREPARING", pname, None,
                         sources=[LOG_FILE],
                         active=lambda: process.poll() is None,
                         finished=lambda: (
-                            "Prepare finished."
+                            ("PREPARED", pname, None)
                             if process.returncode == 0 else
-                            f"Prepare failed (exit {process.returncode})."
+                            ("ERROR", f"prepare failed (exit {process.returncode}) - see the log", None)
                         ),
+                        hint="Preparing the model pack... this may take 2-5 min",
                     )
                 else:
-                    log_page("Prepare failed to start.", sources=[LOG_FILE])
+                    log_page("ERROR", "prepare failed to start", None, sources=[LOG_FILE])
             else:
-                log_page(item.reason or f"{item.status}: no action available.", sources=[])
+                log_page("ERROR", item.reason or f"{item.status}: no action available",
+                         None, sources=[])
             items, unsupported_count = all_items(model_root, show_unsupported)
             pos = 0
         elif key == "r":
@@ -1239,12 +1372,19 @@ def main():
             pos = 0
         elif key == "x":
             request_clear()
+            rt = runtime_load() or {}
+            expected = rt.get("model_name") or "Strata"
+            stop_port = int(rt.get("port", 8080) or 8080)
             stop_thread = stop_in_background()
             log_page(
-                "Stopping…",
+                "STOPPING", expected, None,
                 sources=[LOG_FILE],
                 active=stop_thread.is_alive,
-                finished=lambda: "Stopped.",
+                finished=lambda: (
+                    ("STOPPED", expected, None)
+                    if not health(stop_port) else
+                    ("ERROR", "still running - see the log", stop_port)
+                ),
                 record_finished=False,
             )
             items, unsupported_count = all_items(model_root, show_unsupported)
