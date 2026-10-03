@@ -585,6 +585,17 @@ def installed_configs(conf_root: Path | None = None) -> list[Item]:
     return items
 
 
+def setup_variants_supported() -> bool:
+    """Whether the CURRENT setup.py still has the custom --variant builds (older
+    Strata checkouts do; newer ones removed them).  The launcher follows the
+    installed checkout: no variants available, no variant labels or flags."""
+    try:
+        src = (ROOT / "setup.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return '"--variant"' in src
+
+
 def quant_from_name(name: str) -> str | None:
     m = strata_setup.GGUF_QUANT.search(name)
     return m.group(1).upper() if m else None
@@ -612,6 +623,10 @@ def infer_family(folder: Path, first: Path, model: str) -> str | None:
 
 
 def variant_hint(folder: Path, first: Path, family: str, model: str) -> str | None:
+    if not setup_variants_supported():
+        # the installed setup.py cannot build a variant; a custom file is just
+        # the model its real metadata says it is (the canonical identity)
+        return None
     fam = strata_setup.FAMILIES[family]
     try:
         canonical = fam["file"].format(q=model, i=1)
@@ -785,7 +800,7 @@ def prepare_command(item: Item) -> list[str]:
         "--no-start",
         "--yes",
     ]
-    if item.variant:
+    if item.variant and setup_variants_supported():
         cmd += ["--variant", item.variant]
     return cmd
 
