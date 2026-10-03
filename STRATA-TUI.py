@@ -325,6 +325,16 @@ def config_context(cfg: dict) -> int | None:
         return None
 
 
+def config_vision(cfg: dict) -> str:
+    """The vision state recorded in a config, for the load-options page:
+    Off when there is no vision section, GPU / CPU when the encoder is on
+    (the encoder always runs on a device; "Auto" is stored as GPU)."""
+    vis = cfg.get("vision")
+    if isinstance(vis, dict):
+        return "GPU" if vis.get("gpu") else "CPU"
+    return "Off"
+
+
 def config_source_gguf(cfg: dict) -> Path | None:
     """The raw GGUF shards' folder when the source still exists (any *.gguf arg
     present), else None.  The config itself records where the model came from."""
@@ -808,26 +818,28 @@ def prepare_command(item: Item) -> list[str]:
     return cmd
 
 
-def prepare(item: Item) -> subprocess.Popen | None:
-    """Start setup.py for this model.  Reuses the stored family/model/variant/
-    context; the logs page shows the real command and output."""
-    if item.status != "PREPARE" or not (item.family and item.model):
-        return None
-
-    cmd = prepare_command(item)
-
+def _spawn_setup(cmd: list, header: str) -> subprocess.Popen | None:
+    """Run the current setup.py with output appended to the shared log."""
     log = open(LOG_FILE, "a", encoding="utf-8", errors="replace")
-    log.write(f"\n\n--- PREPARE {time.strftime('%Y-%m-%d %H:%M:%S')} {item.title} ---\n")
+    log.write(f"\n\n--- {header} {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
     log.write(" ".join(f'"{x}"' if " " in x else x for x in cmd) + "\n\n")
     log.flush()
     try:
         process = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT)
     except Exception as e:
-        log.write(f"Prepare failed to start: {e}\n")
+        log.write(f"{header} failed to start: {e}\n")
         log.close()
         return None
     log.close()
     return process
+
+
+def prepare(item: Item) -> subprocess.Popen | None:
+    """Start setup.py for this model.  Reuses the stored family/model/variant/
+    context; the logs page shows the real command and output."""
+    if item.status != "PREPARE" or not (item.family and item.model):
+        return None
+    return _spawn_setup(prepare_command(item), f"PREPARE {item.title}")
 
 
 def runtime_load() -> dict | None:
@@ -1067,15 +1079,20 @@ STATUS_STYLE = {
 
 
 def _status_text(state, spinner: str | None, width: int) -> str:
-    """The plain status-bar text: LOADING/RUNNING/PREPARING/STOPPING/..."""
-    kind, label, port = state
+    """The plain status-bar text: LOADING/RUNNING/PREPARING/STOPPING/...
+    `state` is (kind, label, port, extra) - extra carries e.g. "64K" or
+    "64K · Vision Off" on the LOADING / PREPARING rows."""
+    kind, label, port, extra = state
     label = _short(label, 48)
+    extra = _short(extra, 32) if extra else ""
     if kind == "LOADING":
-        return f"LOADING · {label} · :{port} · {spinner}"
+        where = f" · {extra}" if extra else (f" · :{port}" if port else "")
+        return f"LOADING · {label}{where} · {spinner}"
     if kind == "RUNNING":
         return f"RUNNING · {label} · :{port} · READY"
     if kind == "PREPARING":
-        return f"PREPARING · {label} · {spinner}"
+        where = f" · {extra}" if extra else ""
+        return f"PREPARING · {label}{where} · {spinner}"
     if kind == "STOPPING":
         return f"STOPPING · {label} · {spinner}"
     if kind == "STOPPED":
@@ -1089,7 +1106,7 @@ def _status_text(state, spinner: str | None, width: int) -> str:
 
 def _finish_record(state) -> str | None:
     """One short line recorded in the log when an operation changes state."""
-    kind, label, port = state
+    kind, label, port, _extra = state
     if kind == "RUNNING":
         return f"ready: http://127.0.0.1:{port}/v1"
     if kind == "PREPARED":
@@ -1112,7 +1129,7 @@ def build_log_frame(state, lines, tick: int, busy: bool, hint: str | None,
     """
     width = max(60, min(150, shutil.get_terminal_size((120, 40)).columns - 2))
     rows = max(12, shutil.get_terminal_size((120, 40)).lines - 1)
-    kind, label, _port = state
+    kind, label, _port, _extra = state
 
     spinner = SPINNER[tick % len(SPINNER)] if busy else None
     color = STATUS_STYLE.get(kind, "")
@@ -1140,26 +1157,33 @@ def build_log_frame(state, lines, tick: int, busy: bool, hint: str | None,
     return "\n".join(out) + "\n"
 
 
-def log_page(kind: str, label: str = "", port=None, sources=(LOG_FILE,),
-             active=None, finished=None, record_finished: bool = True,
-             banner: str | None = None, hint: str | None = None):
+def log_page(kind: str, label: str = "", port=None, extra: str = "",
+             sources=(LOG_FILE,), active=None, finished=None,
+             record_finished: bool = True, banner: str | None = None,
+             hint: str | None = None):
     """Operation log page: fixed status bar on top, log tail in the middle,
     one dim key hint at the bottom.
 
-    `state` is (kind, label, port); kind is one of LOADING / RUNNING /
+    `state` is (kind, label, port, extra); kind is one of LOADING / RUNNING /
     PREPARING / STOPPING / STOPPED / PREPARED / ERROR / DONE.  While `active`
-    (a callable) is True the status bar shows a spinner and the page repaints
-    only when the spinner or the log changed - never faster than needed.
-    `finished()` returns the ending state; `banner` is shown once in the log
-    when the state turns RUNNING; `hint` is one dim line shown while active.
-    B / Esc returns; C / M open Chat / Monitor once the model is RUNNING.
+    (a callable) is True the status bar shows a spinner.  When nothing new has
+    arrived, only the one status line is repainted (no whole-terminal redraw);
+    new log text repaints the full page.  `finished()` returns the ending
+    state, or None to keep waiting (e.g. a setup phase handing over to serve).
+    `banner` is shown once in the log when the state turns RUNNING; `hint` is
+    one dim line shown while active.  B / Esc returns; C / M open Chat /
+    Monitor once the model is RUNNING.
     """
     request_clear()
     view = LogView(sources)
-    state = (kind, label, port)
+    state = (kind, label, port, extra)
+    width = max(60, min(150, shutil.get_terminal_size((120, 40)).columns - 2))
     tick = 0
     last_frame = None
-    force = False
+    last_state = None
+    last_lines = None
+    last_spinner = None
+    force = True
     banner_done = False
 
     while True:
@@ -1170,30 +1194,47 @@ def log_page(kind: str, label: str = "", port=None, sources=(LOG_FILE,),
                     end = ("DONE", str(end), None)
                 else:
                     end = tuple(end)
-                state = (end + (None,) * 3)[:3]
+                state = (end + (None,) * 4)[:4]
                 if record_finished:
                     rec = _finish_record(state)
                     if rec:
                         append_log(rec)
-            active = None
+                active = None                        # a final state: done
+            # else: a phase ended but the operation continues (setup -> serve)
 
-        view.read()
+        changed = view.read()
         if state[0] == "RUNNING" and banner and not banner_done:
             view.note(banner)
             banner_done = True
         tick += 1
         busy = active is not None
-        frame = build_log_frame(
-            state, view.lines, tick, busy,
-            hint=hint if busy else None,
-            running=(state[0] == "RUNNING"),
-        )
-        if force or frame != last_frame:
-            paint(frame)
-            last_frame = frame
-            force = False
+        spinner = SPINNER[tick % len(SPINNER)] if busy else None
+        lines_snap = list(view.lines)
 
-        key = read_key(SPINNER_SECONDS if busy else None)
+        if (busy and not changed and not force and state == last_state
+                and lines_snap == last_lines):
+            # only the spinner moves: rewrite just the one status line
+            if spinner != last_spinner:
+                color = STATUS_STYLE.get(state[0], "")
+                row = _pad(color + BOLD + _status_text(state, spinner, width) + RESET, width)
+                sys.stdout.write("\x1b[1;1H" + row + "\x1b[K")
+                sys.stdout.flush()
+                last_spinner = spinner
+        else:
+            frame = build_log_frame(
+                state, lines_snap, tick, busy,
+                hint=hint if busy else None,
+                running=(state[0] == "RUNNING"),
+            )
+            if force or frame != last_frame:
+                paint(frame)
+                last_frame = frame
+                last_state = state
+                last_lines = lines_snap
+                last_spinner = spinner
+                force = False
+
+        key = (read_key(SPINNER_SECONDS if busy else None) or "").lower()
         if key in ("b", "esc"):
             request_clear()                     # the menu clears once on return
             return
@@ -1295,6 +1336,266 @@ def open_strata(fragment: str, items: list[Item]):
     webbrowser.open(f"http://127.0.0.1:{port}/{fragment}")
 
 
+# ---------------------------------------------------------------------------
+# load options - READY + Enter opens this small pre-load page instead of
+# starting directly.  Only choosing Load actually starts the model.
+
+VISION_FLAGS = {"Off": "no", "Auto": "yes", "GPU": "gpu", "CPU": "cpu"}
+CONTEXT_CHOICES = [(32768, "32K"), (65536, "64K"), (131072, "128K"), (262144, "262K")]
+
+
+def ctx_label(ctx) -> str:
+    if isinstance(ctx, int) and ctx > 0:
+        return f"{ctx // 1024}K"
+    return "?"
+
+
+def choose_context_frame(pos: int) -> str:
+    names = [name for _t, name in CONTEXT_CHOICES] + ["Custom"]
+    lines = [BOLD + "CONTEXT" + RESET, ""]
+    lines += [("> " if i == pos else "  ") + name for i, name in enumerate(names)]
+    lines += ["", DIM + "↑/↓ Select   Enter Choose   Esc Back" + RESET]
+    return "\n".join(lines) + "\n"
+
+
+def prompt_context(current: int | None) -> int | None:
+    """Custom context as an integer.  No clamping: the value is passed through
+    to the current setup.py exactly as typed (Esc / empty keeps the value)."""
+    while True:
+        full_clear()
+        print(BOLD + "CUSTOM CONTEXT" + RESET)
+        print()
+        raw = input(f"Context tokens [{current}]: ").strip()
+        request_clear()
+        if not raw:
+            return current
+        try:
+            v = int(raw)
+        except ValueError:
+            v = None
+        if v is None or v <= 0:
+            print(RED + f"{raw!r} is not a positive integer." + RESET)
+            print(DIM + "Press any key to try again, or B / Esc to keep the current value." + RESET)
+            if (read_key() or "").lower() in ("b", "esc"):
+                return current
+            continue
+        return v
+
+
+def choose_context_page(current: int | None) -> int | None:
+    """Context chooser; returns the chosen token count or None on Esc."""
+    pos = len(CONTEXT_CHOICES)                  # Custom, the fallback
+    if isinstance(current, int):
+        for i, (tokens, _name) in enumerate(CONTEXT_CHOICES):
+            if tokens == current:
+                pos = i
+                break
+    count = len(CONTEXT_CHOICES) + 1
+    while True:
+        paint(choose_context_frame(pos))
+        key = (read_key() or "").lower()
+        if key == "up":
+            pos = (pos - 1) % count
+        elif key == "down":
+            pos = (pos + 1) % count
+        elif key in ("esc", "b"):
+            return None
+        elif key == "enter":
+            if pos < len(CONTEXT_CHOICES):
+                return CONTEXT_CHOICES[pos][0]
+            return prompt_context(current)
+
+
+def choose_vision_frame(pos: int) -> str:
+    names = list(VISION_FLAGS)
+    lines = [BOLD + "VISION" + RESET, ""]
+    lines += [("> " if i == pos else "  ") + name for i, name in enumerate(names)]
+    lines += ["", DIM + "↑/↓ Select   Enter Choose   Esc Back" + RESET]
+    return "\n".join(lines) + "\n"
+
+
+def choose_vision_page(current: str) -> str | None:
+    """Vision chooser; returns Off / Auto / GPU / CPU or None on Esc."""
+    names = list(VISION_FLAGS)
+    pos = names.index(current) if current in names else 0
+    while True:
+        paint(choose_vision_frame(pos))
+        key = (read_key() or "").lower()
+        if key == "up":
+            pos = (pos - 1) % len(names)
+        elif key == "down":
+            pos = (pos + 1) % len(names)
+        elif key in ("esc", "b"):
+            return None
+        elif key == "enter":
+            return names[pos]
+
+
+def load_options_frame(item, ctx, vision, pos: int) -> str:
+    lines = [BOLD + "STRATA — LOAD MODEL" + RESET, "",
+             DIM + _short(item.title, 60) + RESET, ""]
+    rows = [("Context", ctx_label(ctx)), ("Vision", vision)]
+    for i, (rname, rval) in enumerate(rows):
+        lines.append(("> " if pos == i else "  ") + f"{rname:<9} {rval}")
+    lines.append("")
+    for i, action in enumerate(("Load", "Back")):
+        lines.append(("> " if pos == len(rows) + i else "  ") + action)
+    lines += ["", DIM + "↑/↓ Select   Enter Change/Confirm   Esc Back" + RESET]
+    return "\n".join(lines) + "\n"
+
+
+def load_options_page(item, ctx, vision) -> tuple:
+    """Small pre-load page.  Returns (action, ctx, vision); action is 'load'
+    or 'back'."""
+    rows = ("Context", "Vision", "Load", "Back")
+    pos = 0
+    while True:
+        paint(load_options_frame(item, ctx, vision, pos))
+        key = (read_key() or "").lower()
+        if key == "up":
+            pos = (pos - 1) % len(rows)
+        elif key == "down":
+            pos = (pos + 1) % len(rows)
+        elif key in ("esc", "b"):
+            return ("back", ctx, vision)
+        elif key == "enter":
+            if pos == 0:
+                new = choose_context_page(ctx)
+                if new is not None:
+                    ctx = new
+            elif pos == 1:
+                new = choose_vision_page(vision)
+                if new is not None:
+                    vision = new
+            elif pos == 2:
+                return ("load", ctx, vision)
+            else:
+                return ("back", ctx, vision)
+
+
+def build_load_plan(item, ctx, vision, current_ctx, current_vision):
+    """The load plan.  None = start the existing config directly (nothing
+    changed).  Otherwise the CURRENT setup.py command that applies the new
+    context / vision first - setup.py keeps the finished pack, so it updates
+    the config instead of rebuilding the model."""
+    if ctx == current_ctx and vision == current_vision:
+        return None
+    src = config_source_gguf(item.cfg or {})
+    if src is None:
+        return None                        # cannot re-run setup.py without the source
+    cmd = [normal_python(), str(ROOT / "setup.py"),
+           "--family", item.family,
+           "--model", item.model,
+           "--gguf-dir", str(src),
+           "--context", str(ctx),
+           "--vision", VISION_FLAGS.get(vision, "no"),
+           "--no-start", "--yes"]
+    if item.variant and setup_variants_supported():
+        cmd += ["--variant", item.variant]
+    return cmd
+
+
+def load_extra(ctx, vision) -> str:
+    bits = []
+    if ctx:
+        bits.append(f"{ctx // 1024}K")
+    bits.append(f"Vision {vision}")
+    return " · ".join(bits)
+
+
+class LoadRunner:
+    """Drives a load: optionally setup.py first (when settings changed), then
+    the server.  The operation log page polls alive()/finish(); finish() may
+    return None once to hand over from the settings phase to the serve phase."""
+
+    def __init__(self, item: Item, setup_cmd):
+        self.item = item
+        self.port = cfg_port(item.cfg or {})
+        self.phase = "setup" if setup_cmd else "serve"
+        self.setup_cmd = setup_cmd
+        self.setup_proc = None
+        self.serve = None                 # (Popen, port) - or False after the attempt
+        self.started = False
+
+    def model_name(self):
+        return (self.item.cfg or {}).get("model_name") or self.item.path.stem
+
+    def alive(self) -> bool:
+        if self.phase == "setup":
+            if self.setup_proc is None:
+                self.setup_proc = _spawn_setup(self.setup_cmd,
+                                               f"LOAD-SETTINGS {self.item.title}")
+                if self.setup_proc is None:
+                    self.phase = "fail"
+                    return False
+            return self.setup_proc.poll() is None
+        if self.phase == "serve":
+            if not self.started:
+                self.serve = start_item(self.item) or False
+                self.started = True
+            if self.serve is False:
+                return False
+            proc, port = self.serve
+            return proc.poll() is None and health(port) is None
+        return False                        # "fail" phase
+
+    def finish(self):
+        if self.phase == "setup":
+            rc = self.setup_proc.returncode if self.setup_proc is not None else -1
+            if rc != 0:
+                return ("ERROR", f"settings update failed (exit {rc}) - see the log", None)
+            self.phase = "serve"           # keep waiting: the server starts next
+            return None
+        if self.phase == "fail":
+            return ("ERROR", "settings update did not start - see the log", None)
+        if self.serve is False:
+            if health(self.port):
+                return ("RUNNING", self.model_name(), self.port)
+            return ("ERROR", "start did not begin - see the log", self.port)
+        proc, port = self.serve
+        if health(port):
+            return ("RUNNING", self.model_name(), port)
+        return ("ERROR", f"start exited ({proc.poll()}) while loading - see the log", port)
+
+
+def start_via_options(item):
+    """READY + Enter: load-options page first; only 'Load' actually starts."""
+    cfg = item.cfg or {}
+    current_ctx = config_context(cfg)
+    current_vision = config_vision(cfg)
+    ctx = current_ctx or DEFAULT_CONTEXT
+    vision = current_vision or "Off"
+
+    action, ctx, vision = load_options_page(item, ctx, vision)
+    if action != "load":
+        return
+
+    port = cfg_port(cfg)
+    model_name = cfg.get("model_name") or item.path.stem
+    if health(port):
+        log_page("RUNNING", model_name, port,
+                 banner=f"==== MODEL READY · http://127.0.0.1:{port} ====")
+        return
+
+    setup_cmd = build_load_plan(item, ctx, vision, current_ctx, current_vision)
+    changed = (ctx != current_ctx) or (vision != current_vision)
+    if changed and setup_cmd is None:
+        # never silently start with settings we could not apply
+        log_page("ERROR", "settings changed, but the model's GGUF folder was not found - "
+                          "nothing was changed", port, sources=[LOG_FILE])
+        return
+    runner = LoadRunner(item, setup_cmd)
+    sources = [LOG_FILE]
+    engine_log = cfg.get("log")
+    if engine_log:
+        sources.append(Path(engine_log))
+    log_page(
+        "LOADING", model_name, port, extra=load_extra(ctx, vision),
+        sources=sources, active=runner.alive, finished=runner.finish,
+        banner=f"==== MODEL READY · http://127.0.0.1:{port} ====",
+    )
+
+
 def main():
     enable_ansi()
     model_root = default_model_root()
@@ -1307,50 +1608,26 @@ def main():
         pos = max(0, min(pos, max(0, len(items) - 1)))
         render_menu(items, pos, model_root, unsupported_count, show_unsupported, notice)
         notice = ""
-        key = read_key()                          # blocking: the menu never redraws on its own
+        key = (read_key() or "").lower()          # blocking: the menu never redraws on its own
 
-        if key == "UP" and items:
+        if key == "up" and items:
             pos = (pos - 1) % len(items)
-        elif key == "DOWN" and items:
+        elif key == "down" and items:
             pos = (pos + 1) % len(items)
-        elif key == "ENTER" and items:
+        elif key == "enter" and items:
             item = items[pos]
             request_clear()
             if item.kind == "config" and item.status == "READY":
-                model_name = item.cfg.get("model_name") or item.path.stem
-                port = cfg_port(item.cfg)
-                started = start_item(item)
-                if started:
-                    process, port = started
-                    cfg = item.cfg or {}
-                    engine_log = Path(cfg["log"]) if cfg.get("log") else None
-                    sources = [LOG_FILE] + ([engine_log] if engine_log else [])
-                    log_page(
-                        "LOADING", model_name, port,
-                        sources=sources,
-                        active=lambda: process.poll() is None and health(port) is None,
-                        finished=lambda: (
-                            ("RUNNING", model_name, port)
-                            if health(port) else
-                            ("ERROR", f"start exited ({process.poll()}) while loading - see the log", port)
-                        ),
-                        banner=f"==== MODEL READY: http://127.0.0.1:{port} ====",
-                    )
-                else:
-                    if health(port):
-                        log_page("RUNNING", model_name, port, sources=[LOG_FILE],
-                                 banner=f"==== MODEL READY: http://127.0.0.1:{port} ====")
-                    else:
-                        log_page("ERROR", "start did not begin - see the log above", port,
-                                 sources=[LOG_FILE])
+                start_via_options(item)
             elif item.status == "PREPARE":
                 process = prepare(item)
                 if process:
-                    pname = item.model or item.title
+                    pname = f"{family_title(item.family)} {item.model}"
                     if item.variant:
-                        pname = f"{pname} · {item.variant}"
+                        pname += f" · {item.variant}"
+                    extra = f"{(item.context or DEFAULT_CONTEXT) // 1024}K"
                     log_page(
-                        "PREPARING", pname, None,
+                        "PREPARING", pname, None, extra=extra,
                         sources=[LOG_FILE],
                         active=lambda: process.poll() is None,
                         finished=lambda: (
@@ -1358,7 +1635,7 @@ def main():
                             if process.returncode == 0 else
                             ("ERROR", f"prepare failed (exit {process.returncode}) - see the log", None)
                         ),
-                        hint="Preparing the model pack... this may take 2-5 min",
+                        hint="Preparing the model pack... this may take several minutes.",
                     )
                 else:
                     log_page("ERROR", "prepare failed to start", None, sources=[LOG_FILE])
