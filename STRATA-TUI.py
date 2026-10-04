@@ -2,7 +2,7 @@
 
 "A small interface, not another layer."
 
-One compact, keyboard-driven terminal screen over the current Strata checkout:
+One compact, keyboard-driven terminal screen over a Strata checkout:
 
   model  ->  prepare  ->  start  ->  logs
 
@@ -11,15 +11,26 @@ reverse proxy, no daemon, no dashboard repainting the menu in the background,
 and no third-party Python dependency: the launcher draws the screen with plain
 ANSI sequences and reuses the Strata checkout's own logic.
 
-Strata remains the source of truth.  Model support comes from the current
+Strata remains the source of truth.  Model support comes from the checkout's
 setup.py (MODELS / FAMILIES / GGUF_QUANT / gguf_dir_shards), GGUF verification
-comes from tools/gguf_reader.py, and preparation is a subprocess call to the
-current setup.py.  If upstream Strata adds or removes a supported quant or
-family, this launcher follows the installed checkout rather than a handwritten
-whitelist.
+comes from its tools/gguf_reader.py, and preparation is a subprocess call to its
+setup.py.  If upstream Strata adds or removes a supported quant or family, this
+launcher follows the installed checkout rather than a handwritten whitelist.
 
-Place STRATA-TUI.py in the Strata repository root (or tools/strata_tui.py,
-which resolves the root the same way).
+SINGLE-FILE / PORTABLE
+
+This file is self-contained (no companion modules, no config JSON): the custom-
+build knowledge that used to require patched setup.py - the variant label of a
+strata-<size>-<variant>.json config, the friendly API id, the external
+convert-after-setup install flow - is inlined below (the VARIANT section).  It
+can run from anywhere:
+
+  - dropped INSIDE the checkout root (STRATA-TUI.py at the repo root, or
+    tools/STRATA_TUI.py): the checkout is found from the location.
+  - standalone: the checkout is read from STRATA_ROOT (environment variable),
+    or from a `strata-root.txt` file next to this file (first line = the path).
+
+It never patches official files, so Strata updates can never conflict with it.
 """
 
 from __future__ import annotations
@@ -43,7 +54,7 @@ from pathlib import Path
 from urllib.request import urlopen
 
 _HERE = Path(__file__).resolve()
-ROOT = _HERE.parent if _HERE.name == "STRATA-TUI.py" else _HERE.parent.parent
+HERE = _HERE.parent               # this file's own folder (logging, strata-root.txt)
 
 
 def _smash(text: str) -> str:
@@ -51,12 +62,66 @@ def _smash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
+def _resolve_strata_root() -> Path:
+    """The Strata checkout this launcher drives, found in this order:
+
+      1. a `--root DIR` argument (used by the inlined --prepare / --apply-settings modes)
+      2. this file's own location: inside the checkout root, or a tools/ subfolder of it
+      3. a `strata-root.txt` file next to this file (portable standalone use)
+      4. the STRATA_ROOT environment variable
+
+    Any candidate must contain setup.py (a real Strata checkout)."""
+    def ok(p) -> bool:
+        return p is not None and (p / "setup.py").is_file()
+
+    argv = sys.argv[1:]
+    if "--root" in argv:
+        try:
+            cand = Path(argv[argv.index("--root") + 1]).expanduser()
+        except (IndexError, TypeError):
+            cand = None
+        if ok(cand):
+            return cand.resolve()
+
+    here = Path(__file__).resolve().parent
+    if ok(here):                                   # installed at the checkout root
+        return here
+    if ok(here.parent) and _HERE.name != "STRATA-TUI.py":
+        return here.parent                         # a tools/strata_tui.py style location
+
+    root_file = here / "strata-root.txt"
+    if root_file.is_file():
+        try:
+            text = root_file.read_text(encoding="utf-8", errors="replace").strip().strip('"')
+        except OSError:
+            text = ""
+        if ok(Path(text).expanduser()) if text else False:
+            return Path(text).expanduser().resolve()
+
+    env = os.environ.get("STRATA_ROOT", "")
+    if env and ok(Path(env)):
+        return Path(env).expanduser().resolve()
+
+    print("STRATA-TUI: no Strata checkout found.")
+    print("  - drop STRATA-TUI.py into the Strata repository root (or tools/), or")
+    print(f"  - write the checkout's path into {here / 'strata-root.txt'}, or")
+    print("  - set the STRATA_ROOT environment variable.")
+    raise SystemExit(1)
+
+
+ROOT = _resolve_strata_root()
+
 SETTINGS_FILE = Path.home() / ".strata-tui.json"
 RUNTIME_FILE = Path(tempfile.gettempdir()) / (
     "strata-tui-" + _smash(str(ROOT))[:10] + ".json"
 )
-LOG_FILE = ROOT / "strata-tui.log"
+LOG_FILE = HERE / "logs" / "strata-tui.log"
 DEFAULT_CONTEXT = 65536
+
+try:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 
 
 if str(ROOT) not in sys.path:
@@ -65,8 +130,10 @@ if str(ROOT) not in sys.path:
 try:
     import setup as strata_setup
 except Exception as e:
-    print("Cannot import Strata setup.py.")
-    print(f"Put STRATA-TUI.py in the Strata repository root.\n\n{e}")
+    print("Cannot import Strata setup.py (the checkout found at STRATA_ROOT).")
+    print(f"Checkout used: {ROOT} (this file is {_HERE}).")
+    print()
+    print(e)
     raise SystemExit(1)
 
 try:
@@ -74,8 +141,8 @@ try:
         sys.path.insert(0, str(ROOT / "tools"))
     from gguf_reader import GGUFFile
 except Exception as e:
-    print("Cannot import Strata tools/gguf_reader.py.")
-    print(f"This TUI needs the current Strata repository's own GGUF reader.\n\n{e}")
+    print("Cannot import Strata tools/gguf_reader.py (the official checkout).")
+    print(f"This TUI needs the official Strata repository's own GGUF reader.\n\n{e}")
     raise SystemExit(1)
 
 RESET = "\x1b[0m"
@@ -88,6 +155,361 @@ CYAN = "\x1b[96m"
 GRAY = "\x1b[90m"
 SPINNER = "|/-\\"          # ASCII spinner: renders everywhere
 SPINNER_SECONDS = 0.25   # status-bar animation while an operation runs
+
+
+# ---------------------------------------------------------------------------
+# VARIANT - the custom build's identity and install, INLINED (single-file).
+#
+# Official setup.py names a model only from its size (strata-<size>.json); it no
+# longer has --variant.  A custom build (strata-q2_0-abliterated.json with its own
+# model_name + aliases) is kept apart here, entirely outside the official code:
+#
+#   identity   merged from the config's OWN model_name (the same field the
+#              official serve/server.py serves), see reconcile_identity()
+#   prepare    run the OFFICIAL setup.py; convert the result to the variant's
+#              own config + pack, restore the canonical install (renames only)
+#   settings   edit the variant's own config file directly (apply_settings),
+#              never re-run setup.py through the canonical slot
+
+
+# ---- identity -----------------------------------------------------------------
+def _family_name_map() -> dict:
+    """family name -> (family key, tag): the exact prefixes generate the official
+    model_name (setup.py writes cfg["model_name"] = f"{fam['name']}-{model}")."""
+    m = {}
+    for key, fam in (getattr(strata_setup, "FAMILIES", {}) or {}).items():
+        name = str(fam.get("name") or "").lower()
+        if name:
+            m[name] = (key, str(fam.get("tag") or ""))
+    return m
+
+
+def _variant_from_model_name(model_name: str) -> tuple:
+    """(family, model, variant) from a config's own model_name:
+    '<fam-name>-<size>[-<variant>]' -> ('qwen', 'Q2_0', 'abliterated')."""
+    name = str(model_name or "").lower()
+    for famname, (key, _tag) in _family_name_map().items():
+        if name.startswith(famname + "-"):
+            rest = name[len(famname) + 1:]
+            for q in sorted(getattr(strata_setup, "MODELS", {}), key=len, reverse=True):
+                low = q.lower()
+                if rest == low:
+                    return key, q, None
+                if rest.startswith(low + "-"):
+                    return key, q, rest[len(low) + 1:]
+            return key, None, rest or None
+    return None, None, None
+
+
+def reconcile_identity(config_name: str, official: dict, cfg: dict | None = None) -> dict:
+    """Merge the official setup.choices_from_config() answer with the config's own
+    model_name.  Official answers win when usable; a custom build's stem (which
+    official setup cannot name) is filled from model_name - exactly what the
+    Manager used to get from a metadata json."""
+    out = dict(official)
+    if out.get("model"):
+        return out                          # official setup named the size: nothing to add
+    if cfg is None:
+        try:
+            cfg = read_json(_config_path(config_name))
+        except Exception:
+            cfg = {}
+    family, model, variant = _variant_from_model_name(cfg.get("model_name") or "")
+    if family:
+        out["family"] = family
+    if model:
+        out["model"] = model
+    if variant:
+        out["variant"] = variant
+    return out
+
+
+def _config_path(config_name: str):
+    p = Path(config_name)
+    return p if p.is_absolute() else ROOT / p.name
+
+
+# ---- install (prepare) / settings, inlined from manager_identity -------------------------------
+def _read_cfg(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _write_cfg(path: Path, cfg: dict) -> None:
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=1, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _arg_val(args: list, key: str):
+    try:
+        i = args.index(key)
+        return args[i + 1] if i + 1 < len(args) else None
+    except ValueError:
+        return None
+
+
+def _replace_arg(args: list, key: str, value) -> list:
+    out = list(args)
+    try:
+        i = out.index(key)
+        out[i + 1] = str(value)
+    except ValueError:
+        out += [key, str(value)]
+    return out
+
+
+def _drop_arg(args: list, key: str) -> list:
+    out, i = [], 0
+    while i < len(args):
+        if args[i] == key:
+            if i + 1 < len(args) and not str(args[i + 1]).startswith("--"):
+                i += 2
+            else:
+                i += 1
+            continue
+        out.append(args[i])
+        i += 1
+    return out
+
+
+_CONVERT_REC = Path("logs") / "manager-convert-{tag}.json"     # relative to ROOT
+
+
+def _record_backup(tag: str, stamp: str, moved: dict) -> dict:
+    state = ROOT / str(_CONVERT_REC).format(tag=tag)
+    if stamp:
+        try:
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(json.dumps({"tag": tag, "stamp": stamp, "moved": moved}),
+                             encoding="utf-8")
+        except OSError:
+            pass
+    try:
+        return json.loads(state.read_text(encoding="utf-8")).get("moved") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _variant_backup_suffix() -> str:
+    return ".bak-convert-" + time.strftime("%Y%m%d-%H%M%S")
+
+
+def _bail_out(tag: str) -> dict:
+    """Move the canonical install (strata-<tag>.json + its pack + run script) aside
+    for the duration of the official setup run, so it cannot be destroyed."""
+    cfg_path = ROOT / f"strata-{tag}.json"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    moved = {"config": None, "pack": None, "run": None}
+    try:
+        cfg = _read_cfg(cfg_path)
+        pack = Path(_arg_val(cfg.get("args") or [], "--pack") or "")
+        if pack.is_dir():
+            bak = Path(str(pack) + f".bak-convert-{stamp}")
+            if not bak.exists():
+                pack.rename(bak)
+                moved["pack"] = (str(pack), str(bak))
+        run_bat = ROOT / f"run-{tag}.bat"
+        if run_bat.is_file():
+            bak = Path(str(run_bat) + f".bak-convert-{stamp}")
+            run_bat.rename(bak)
+            moved["run"] = (str(run_bat), str(bak))
+        bak = Path(str(cfg_path) + f".bak-convert-{stamp}")
+        if not bak.exists():
+            cfg_path.rename(bak)
+            moved["config"] = (str(cfg_path), str(bak))
+    except OSError as e:
+        raise RuntimeError(f"could not set the canonical {tag} install aside: {e}")
+    _record_backup(tag, stamp, moved)
+    return moved
+
+
+def _restore(tag: str) -> None:
+    """Put the canonical install back (renames only); anything the run left at a
+    canonical name is disposable (it was built this run)."""
+    rec = _record_backup(tag, "", {})
+    for slot, v in (rec or {}).items():
+        if not isinstance(v, (tuple, list)) or len(v) != 2 or not v[1]:
+            continue
+        orig, bak = v
+        if not Path(bak).exists():
+            continue
+        if Path(orig).exists():
+            Path(orig).unlink()
+        Path(bak).rename(orig)
+
+
+def _same_gguf_source(cfg_path: Path, gguf_dir: str) -> bool:
+    try:
+        cfg = _read_cfg(cfg_path)
+        native = _arg_val(cfg.get("args") or [], "--native")
+        return bool(native) and Path(native).resolve().parent == Path(gguf_dir).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _convert_fresh(tag: str, variant: str) -> None:
+    """Turn the just-written canonical install (fresh pack + config from the official
+    run) into the variant install: its own pack folder and config (model_name +
+    aliases + log).  The pack is RENAMED - same volume, no copy, no extra disk."""
+    cfg_path = ROOT / f"strata-{tag}.json"
+    cfg = _read_cfg(cfg_path)
+    args = list(cfg.get("args") or [])
+    pack = Path(_arg_val(args, "--pack") or "")
+    fam_name = next((f for f, d in (strata_setup.FAMILIES or {}).items()
+                     if d.get("tag") and tag.startswith(d["tag"])), "qwen")
+    fam = (strata_setup.FAMILIES or {}).get(fam_name, {})
+    model = (tag[len(fam.get("tag", "")):] if tag.startswith(fam.get("tag", "")) else tag).upper()
+    if model not in (strata_setup.MODELS or {}):
+        model = tag.split("-")[-1].upper()
+
+    variant_pack = pack.with_name(pack.name + "-" + variant) if pack.name else pack
+    if pack.is_dir():
+        if variant_pack.exists():
+            raise RuntimeError(f"the pack folder {variant_pack} already exists - another build of "
+                               "this size and label already uses it")
+        pack.rename(variant_pack)
+    else:
+        raise RuntimeError(f"setup.py finished but wrote no pack at {pack}")
+
+    model_name = f"{fam.get('name', 'qwen3.8-flash-next')}-{model.lower()}-{variant}"
+    canonical_id = f"{fam.get('name', 'qwen3.8-flash-next')}-{model.lower()}"
+    cfg["args"] = _replace_arg(args, "--pack", str(variant_pack))
+    cfg["tokenizer"] = str(variant_pack / "tokenizer")
+    cfg["model_name"] = model_name
+    cfg["aliases"] = [canonical_id]
+    cfg["log"] = str(ROOT / f"strata-{tag}-{variant}.log")
+    _write_cfg(ROOT / f"strata-{tag}-{variant}.json", cfg)
+
+
+def prepare_variant_cli(args: list[str]) -> int:
+    """--prepare: the inlined external install of a custom GGUF build.
+        1. move the canonical install aside
+        2. run the OFFICIAL setup.py (canonical names - all it knows)
+        3. convert to the variant's own config + pack
+        4. restore the canonical install (renames only)
+    setup.py is never patched; the GGUF files are only read."""
+    def av(name, default=""):
+        return args[args.index(name) + 1] if name in args else default
+
+    root = Path(av("--root") or ROOT).expanduser().resolve()
+    variant = (av("--variant") or "").strip().lower().replace(" ", "-")
+    if not re.fullmatch(r"[a-z0-9_-]+", variant):
+        print("  [x] --variant needs letters, digits, '-' and '_' only")
+        return 1
+    family, model, gguf_dir = av("--family", "qwen"), av("--model", "Q2_0"), av("--gguf-dir")
+    if not gguf_dir:
+        print("  [x] --prepare needs --gguf-dir DIR")
+        return 1
+    ctx = int(av("--context") or "65536")
+    vision = av("--vision") or "no"
+    log = av("--log") or ""
+
+    sys.path.insert(0, str(root))
+    import setup as root_setup
+    fam = root_setup.FAMILIES[family]
+    tag = (fam["tag"] + model).lower()
+    variant_cfg = root / f"strata-{tag}-{variant}.json"
+    if variant_cfg.exists():
+        if _same_gguf_source(variant_cfg, gguf_dir):
+            print(f"  [ok] {variant_cfg.name} already points at {gguf_dir} - nothing to do")
+            return 0
+        print(f"  [x] another build already occupies {variant_cfg.name}; choose another --variant "
+              "label")
+        return 1
+
+    orig_root = ROOT                      # the module-level ROOT belongs to the launcher mode
+    globals()["ROOT"] = root
+    moved = {}
+    try:
+        moved = _bail_out(tag)
+        out = open(log, "a", encoding="utf-8", errors="replace") if log else None
+        try:
+            cmd = [sys.executable, str(root / "setup.py"), "--family", family, "--model", model,
+                   "--gguf-dir", str(Path(gguf_dir)), "--context", str(ctx),
+                   "--vision", vision, "--no-start", "--yes"]
+            p = subprocess.Popen(cmd, cwd=str(root), stdout=out, stderr=subprocess.STDOUT)
+            rc = p.wait()
+        finally:
+            if out:
+                out.close()
+        if rc != 0:
+            print(f"  [x] official setup.py exited {rc}; the canonical install was restored, "
+                  "nothing changed")
+            _restore(tag)
+            return rc
+        _convert_fresh(tag, variant)
+        _restore(tag)
+    except Exception as e:
+        try:
+            _restore(tag)
+        except Exception:
+            pass
+        print(f"  [x] prepare failed: {e} - the canonical install was restored, nothing changed")
+        return 1
+    finally:
+        globals()["ROOT"] = orig_root
+    print(f"  [ok] {variant}'s build installed: strata-{tag}-{variant}.json")
+    return 0
+
+
+def apply_settings_cli(args: list[str]) -> int:
+    """--apply-settings: edit ONE config file directly (context / vision), keeping the
+    variant's separate identity - official setup.py is never re-run for a variant."""
+    def av(name, default=""):
+        return args[args.index(name) + 1] if name in args else default
+
+    root = Path(av("--root") or ROOT).expanduser().resolve()
+    name = av("--config")
+    if not name:
+        print("  [x] --apply-settings needs --config NAME")
+        return 1
+    cfg_path = root / Path(name).name
+    if not cfg_path.is_file():
+        print(f"  [x] no such config: {cfg_path}")
+        return 1
+
+    sys.path.insert(0, str(root))
+    import setup as root_setup
+    try:
+        cfg = _read_cfg(cfg_path)
+        a2 = list(cfg.get("args") or [])
+        ctx = int(av("--context")) if (av("--context") or "").isdigit() else 0
+        if ctx:
+            a2 = _replace_arg(a2, "--max-context", str(ctx))
+            if ctx <= 8192:
+                a2 = _drop_arg(a2, "--kv")
+            elif _arg_val(a2, "--kv") is None:
+                a2 = _replace_arg(a2, "--kv", "int8")
+            if ctx < 65536:
+                a2 = _drop_arg(a2, "--kv-resident")
+            if ctx > 262144 and _arg_val(a2, "--rope-scaling") is None:
+                a2 = _replace_arg(a2, "--rope-scaling", "yarn")
+                a2 = _replace_arg(a2, "--rope-scale", f"{root_setup.derived_factor(ctx):g}")
+        vision = (av("--vision") or "").lower()
+        if vision in ("no", "off", "none"):
+            cfg.pop("vision", None)
+            a2 = _drop_arg(_drop_arg(a2, "--vision"), "--vram-reserve-mib")
+        elif vision in ("gpu", "yes", "cpu"):
+            cur = cfg.get("vision")
+            if not isinstance(cur, dict):
+                print("  [x] Vision is not installed for this model (no encoder section); run the "
+                      "official SETUP.bat --vision for this size first.")
+                return 1
+            mode = "gpu" if vision in ("gpu", "yes") else "cpu"
+            cur = dict(cur)
+            cur["gpu"] = (mode == "gpu")
+            cur["max_tokens"] = root_setup.VISION[mode]["max_tokens"]
+            cfg["vision"] = cur
+            if "--vision" not in a2:
+                a2 = a2 + ["--vision"]
+            a2 = _replace_arg(a2, "--vram-reserve-mib", str(root_setup.VISION[mode]["reserve_mib"]))
+        cfg["args"] = a2
+        _write_cfg(cfg_path, cfg)
+        print(f"  [ok] {cfg_path.name}: context/vision updated (model_name + aliases kept)")
+        return 0
+    except Exception as e:
+        print(f"  [x] could not update {cfg_path.name}: {e}")
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -534,8 +956,11 @@ class Item:
 
 
 def config_identity(path: Path) -> tuple[str | None, str | None, str | None, int | None]:
+    """(family, model, variant, context) of a strata-*.json config: the official setup.py's own
+    read-back, completed from the config's own model_name for a custom build official setup
+    cannot name (its stem ends in a variant label) - see reconcile_identity()."""
     try:
-        c = strata_setup.choices_from_config(path)
+        c = reconcile_identity(path.name, strata_setup.choices_from_config(path))
         return c.get("family"), c.get("model"), c.get("variant"), c.get("context")
     except Exception:
         return None, None, None, None
@@ -599,14 +1024,11 @@ def installed_configs(conf_root: Path | None = None) -> list[Item]:
 
 
 def setup_variants_supported() -> bool:
-    """Whether the CURRENT setup.py still has the custom --variant builds (older
-    Strata checkouts do; newer ones removed them).  The launcher follows the
-    installed checkout: no variants available, no variant labels or flags."""
-    try:
-        src = (ROOT / "setup.py").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    return '"--variant"' in src
+    """The custom --variant builds setup.py used to offer are gone from official Strata; the variant
+    knowledge now lives INLINED in this file (reconcile_identity / prepare_variant_cli /
+    apply_settings_cli).  Kept as a named check so this launcher works with any official setup.py -
+    variants keep working without any patch."""
+    return True
 
 
 def quant_from_name(name: str) -> str | None:
@@ -636,10 +1058,8 @@ def infer_family(folder: Path, first: Path, model: str) -> str | None:
 
 
 def variant_hint(folder: Path, first: Path, family: str, model: str) -> str | None:
-    if not setup_variants_supported():
-        # the installed setup.py cannot build a variant; a custom file is just
-        # the model its real metadata says it is (the canonical identity)
-        return None
+    """A custom GGUF folder's own label, read from its name (external logic: the variant knowledge
+    that used to require a patched setup.py).  None for the exact published name."""
     fam = strata_setup.FAMILIES[family]
     try:
         canonical = fam["file"].format(q=model, i=1)
@@ -795,7 +1215,10 @@ def normal_python() -> str:
 
 
 def prepare_command(item: Item) -> list[str]:
-    """The CURRENT Strata setup.py's own prepare workflow, not a reimplementation."""
+    """The CURRENT official Strata setup.py's own prepare workflow, not a reimplementation.  A custom
+    build (variant) goes through the INLINED helper (this same file with --prepare): official setup
+    writes the canonical names, the helper converts the result into the variant's own config + pack
+    and restores the canonical install - setup.py is never patched, nothing is duplicated."""
     gguf_dir = item.prepare_dir or item.path
     ctx = item.context or DEFAULT_CONTEXT
     contexts = list(getattr(strata_setup, "CONTEXTS", [DEFAULT_CONTEXT]))
@@ -804,7 +1227,18 @@ def prepare_command(item: Item) -> list[str]:
     elif ctx not in contexts and contexts:
         ctx = contexts[0]
 
-    cmd = [
+    if item.variant:
+        return [
+            normal_python(), str(_HERE), "--prepare",
+            "--root", str(ROOT),
+            "--family", item.family,
+            "--model", item.model,
+            "--gguf-dir", str(gguf_dir),
+            "--context", str(ctx),
+            "--variant", item.variant,
+            "--log", str(LOG_FILE),
+        ]
+    return [
         normal_python(), str(ROOT / "setup.py"),
         "--family", item.family,
         "--model", item.model,
@@ -813,9 +1247,6 @@ def prepare_command(item: Item) -> list[str]:
         "--no-start",
         "--yes",
     ]
-    if item.variant and setup_variants_supported():
-        cmd += ["--variant", item.variant]
-    return cmd
 
 
 def _spawn_setup(cmd: list, header: str) -> subprocess.Popen | None:
@@ -1475,23 +1906,40 @@ def load_options_page(item, ctx, vision) -> tuple:
 
 def build_load_plan(item, ctx, vision, current_ctx, current_vision):
     """The load plan.  None = start the existing config directly (nothing
-    changed).  Otherwise the CURRENT setup.py command that applies the new
+    changed).  Otherwise the CURRENT official setup.py command that applies the new
     context / vision first - setup.py keeps the finished pack, so it updates
-    the config instead of rebuilding the model."""
+    the config instead of rebuilding the model.  A custom build (variant) is NEVER
+    re-prepared through the canonical slot: its settings are applied to its own
+    config file directly (the inlined --apply-settings), so the variant stays a
+    separate model and official Strata is never patched."""
     if ctx == current_ctx and vision == current_vision:
         return None
+    if item.variant:
+        return _variant_settings_cmd(item, ctx, vision)
     src = config_source_gguf(item.cfg or {})
     if src is None:
         return None                        # cannot re-run setup.py without the source
-    cmd = [normal_python(), str(ROOT / "setup.py"),
-           "--family", item.family,
-           "--model", item.model,
-           "--gguf-dir", str(src),
-           "--context", str(ctx),
-           "--vision", VISION_FLAGS.get(vision, "no"),
-           "--no-start", "--yes"]
-    if item.variant and setup_variants_supported():
-        cmd += ["--variant", item.variant]
+    return [normal_python(), str(ROOT / "setup.py"),
+            "--family", item.family,
+            "--model", item.model,
+            "--gguf-dir", str(src),
+            "--context", str(ctx),
+            "--vision", VISION_FLAGS.get(vision, "no"),
+            "--no-start", "--yes"]
+
+
+def _variant_settings_cmd(item, ctx, vision) -> list[str]:
+    """A custom build's settings change: edit its OWN config file directly (the inlined
+    --apply-settings helper in this file), keeping the variant's separate identity
+    (model_name/aliases/pack) - official setup.py would write the canonical slot instead,
+    which this must never do."""
+    cmd = [normal_python(), str(_HERE), "--apply-settings",
+           "--root", str(ROOT), "--config", item.path.name]
+    if item.cfg is not None:
+        cmd += ["--save-backup"]
+    if ctx:
+        cmd += ["--context", str(ctx)]
+    cmd += ["--vision", str(VISION_FLAGS.get(vision, "no"))]
     return cmd
 
 
@@ -1683,4 +2131,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--prepare" in sys.argv[1:]:
+        sys.exit(prepare_variant_cli(sys.argv[1:]))
+    if "--apply-settings" in sys.argv[1:]:
+        sys.exit(apply_settings_cli(sys.argv[1:]))
     main()

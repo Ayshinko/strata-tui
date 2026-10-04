@@ -10,15 +10,39 @@
     5. if validation or the copy fails, restore the previous working runtime
 
     Nothing else is ever touched: setup.py, serve/, tools/, models, packs and
-    configs stay exactly as they are.
+    configs stay exactly as they are.  The Strata checkout is detected
+    automatically (STRATA_ROOT, a sibling "strata" folder, or a prompt) -
+    nothing is hard-coded.
+
+.PARAMETER StrataDir
+    A Strata checkout (must contain setup.py).  When omitted, detected in this
+    order: $env:STRATA_ROOT, a sibling "strata" folder of this repository,
+    then an interactive prompt.
 #>
 [CmdletBinding()]
 param(
-    [string]$StrataDir = "C:\Users\matri\strata"
+    [string]$StrataDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+if ([string]::IsNullOrWhiteSpace($StrataDir)) {
+    if ($env:STRATA_ROOT -and (Test-Path (Join-Path $env:STRATA_ROOT "setup.py"))) {
+        $StrataDir = $env:STRATA_ROOT
+    }
+    elseif (Test-Path (Join-Path (Split-Path $Repo -Parent) "strata")) {
+        $StrataDir = Join-Path (Split-Path $Repo -Parent) "strata"
+    }
+    else {
+        $StrataDir = Read-Host "Strata checkout path (the folder with setup.py)"
+    }
+}
+$StrataDir = $StrataDir.TrimEnd('\', '/')
+if (-not (Test-Path (Join-Path $StrataDir "setup.py"))) {
+    Write-Host "[update] No Strata checkout at $StrataDir (setup.py not found)." -ForegroundColor Red
+    exit 1
+}
 
 function Write-Step($msg) {
     Write-Host ""
