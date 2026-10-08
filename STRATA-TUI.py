@@ -2,8 +2,7 @@
 
 "A small interface, not another layer."
 
-One compact, keyboard-driven terminal screen over the official Strata checkout at STRATA_ROOT
-(see manager.env):
+A compact, keyboard-driven terminal interface for an installed Strata checkout:
 
   model  ->  prepare  ->  start  ->  logs
 
@@ -18,12 +17,9 @@ comes from its tools/gguf_reader.py, and preparation is a subprocess call to its
 setup.py.  If upstream Strata adds or removes a supported quant or family, this
 launcher follows the installed checkout rather than a handwritten whitelist.
 
-This launcher lives OUTSIDE the official repository (C:/AI/Tools/Strata-Manager).
-It reads the official files through STRATA_ROOT and never patches them, so Strata
-updates can never conflict with it.  Custom-build knowledge (the variant label of
-strata-<size>-<variant>.json configs, the friendly API ids in manager-models.json)
-lives externally in manager_identity.py - the part that used to require a patched
-setup.py.
+STRATA-TUI is a standalone companion to Strata. It reads the installed Strata
+capabilities and configuration, and never patches official source files. Custom
+variant identity and load helpers live in companion modules in this checkout.
 """
 
 from __future__ import annotations
@@ -47,7 +43,7 @@ from pathlib import Path
 from urllib.request import urlopen
 
 _HERE = Path(__file__).resolve()
-MANAGER_DIR = _HERE.parent             # this manager's folder (manager.env, manager_identity.py)
+TUI_DIR = _HERE.parent                 # this checkout and its local configuration/helpers
 
 
 def _smash(text: str) -> str:
@@ -55,8 +51,8 @@ def _smash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
-if str(MANAGER_DIR) not in sys.path:
-    sys.path.insert(0, str(MANAGER_DIR))
+if str(TUI_DIR) not in sys.path:
+    sys.path.insert(0, str(TUI_DIR))
 import manager_config as _mcfg        # noqa: E402
 import manager_identity               # noqa: E402
 import vram as _vram                  # noqa: E402  (LOAD MODEL VRAM helpers)
@@ -67,7 +63,7 @@ SETTINGS_FILE = Path.home() / ".strata-tui.json"
 RUNTIME_FILE = Path(tempfile.gettempdir()) / (
     "strata-tui-" + _smash(str(ROOT))[:10] + ".json"
 )
-LOG_FILE = MANAGER_DIR / "logs" / "strata-tui.log"
+LOG_FILE = TUI_DIR / "logs" / "strata-tui.log"
 DEFAULT_CONTEXT = 65536
 
 try:
@@ -83,7 +79,7 @@ try:
     import setup as strata_setup
 except Exception as e:
     print("Cannot import Strata setup.py (the official checkout at STRATA_ROOT).")
-    print(f"Manager root used: {MANAGER_DIR}; set STRATA_ROOT in {MANAGER_DIR / 'manager.env'}.")
+    print(f"STRATA-TUI checkout: {TUI_DIR}; set STRATA_ROOT in {TUI_DIR / 'manager.env'}.")
     print()
     print(e)
     raise SystemExit(1)
@@ -826,7 +822,7 @@ def prepare_command(item: Item) -> list[str]:
 
     if item.variant:
         return [
-            normal_python(), str(MANAGER_DIR / "manager_identity.py"), "--prepare",
+            normal_python(), str(TUI_DIR / "manager_identity.py"), "--prepare",
             "--root", str(ROOT),
             "--family", item.family,
             "--model", item.model,
@@ -1555,7 +1551,7 @@ def _variant_settings_cmd(item, ctx, vision) -> list[str]:
     """A custom build's settings change: edit its OWN config file directly (external
     helper), keeping the variant's separate identity (its model_name/aliases/pack)
     - official setup.py would write the canonical slot instead, which this must never do."""
-    cmd = [normal_python(), str(MANAGER_DIR / "manager_identity.py"), "--apply-settings",
+    cmd = [normal_python(), str(TUI_DIR / "manager_identity.py"), "--apply-settings",
            "--root", str(ROOT), "--config", item.path.name]
     if item.cfg is not None:
         cmd += ["--save-backup"]
@@ -1569,7 +1565,7 @@ def build_vram_settings_cmd(item, cfg, kv_vram, reserve) -> list[str]:
     """Build the final, VRAM-only config edit.  It deliberately omits context
     and Vision so it can run after setup.py without reapplying either setting."""
     kv_arg, reserve_arg = _vram.effective_args(cfg, kv_vram, reserve)
-    cmd = [normal_python(), str(MANAGER_DIR / "manager_identity.py"),
+    cmd = [normal_python(), str(TUI_DIR / "manager_identity.py"),
            "--apply-settings", "--root", str(ROOT), "--config", item.path.name,
            "--kv-resident", str(kv_arg),
            "--vram-reserve-mib", str(reserve_arg)]

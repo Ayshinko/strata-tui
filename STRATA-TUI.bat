@@ -1,6 +1,5 @@
 @echo off
-rem STRATA-TUI - the external minimal terminal launcher for the official Strata checkout at
-rem STRATA_ROOT (see manager.env).  Lives OUTSIDE the repo; never patches official files.
+rem STRATA-TUI - lightweight terminal controls for Strata. Does not modify Strata source.
 setlocal
 cd /d "%~dp0"
 

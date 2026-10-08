@@ -1,68 +1,63 @@
-# Strata Manager
+# STRATA-TUI
 
-The **external** Manager / TUI for your official Strata checkout.  This folder lives
-**outside** `C:\AI\Runtime\Strata` and treats that repo as read-only:
+A lightweight, standalone control interface for Strata.
 
-```
-C:\AI\Runtime\Strata            PURE official Strata (tracks upstream/main; UPDATE.bat)
-    └── setup.py, serve/, engine/ …   official code, never patched from here
+STRATA-TUI makes Strata easier to use without adding another heavy management layer. It provides a simple terminal interface for configuring models, starting and stopping Strata, switching models, tuning runtime settings, and viewing logs.
 
-C:\AI\Tools\Strata-Manager    all Manager/TUI code (this folder)
-    ├── manager.env              STRATA_ROOT / STRATA_API / MANAGER_PORT (the only place paths live)
-    ├── manager-models.json      friendly API id -> config -> GGUF path -> display name
-    ├── manager_config.py        the config loader
-    ├── manager_identity.py      the external compatibility layer (identity + variant installs)
-    ├── gui/                     the Manager web server (port 8275, proxy, supervisor)
-    ├── STRATA-TUI.py/.bat       the minimal terminal launcher
-    ├── START-MANAGER.bat        opens the Manager (no console window)
-    └── logs/                    the Manager's own runtime files
-```
+## Features
 
-## Why it exists
+- Start and stop Strata
+- Switch between installed models
+- Adjust model loading settings
+- Configure Context, Vision, VRAM reserve, and KV cache
+- Estimate MoE experts that can fit in VRAM
+- Prepare models when required
+- View live loading and runtime logs
+- Open Chat and Monitor directly
+- Automatically use the capabilities of the installed Strata version
 
-Strata updates used to conflict with the Manager because the Manager's custom
-model-identity code was **patched into official files** (setup.py's `--variant`,
-`api_identity`, `saved_aliases`, ...).  With this layout nothing patched remains:
+## Lightweight by design
 
-- `setup.py`, `serve/`, `engine/` are exactly upstream.
-- The Manager reads the official `setup.py` module *as data* (`import setup` from
-  STRATA_ROOT), reads the `strata-*.json` configs, starts `serve/server.py`, and
-  proxies the API — official source is never written.
-- Custom-build knowledge (the abliterated model's identity, the alias map) lives in
-  `manager-models.json` + `manager_identity.py`.
+STRATA-TUI is intentionally small and uses very little CPU and memory.
+
+Its workflow is:
+
+**configure → load → run → monitor → stop / switch**
+
+It does not replace Strata and does not patch Strata source files. STRATA-TUI stays separate from the main Strata installation, so Strata can be updated normally without maintaining custom modifications inside the Strata repository.
 
 ## Start
 
-```
-C:\AI\Tools\Strata-Manager\START-MANAGER.bat     # the web Manager on port 8275
-C:\AI\Tools\Strata-Manager\STRATA-TUI.bat        # the terminal launcher
-```
+Windows:
 
-Update Strata the normal way — it can never touch this folder:
-
-```
-cd C:\AI\Runtime\Strata
-.\UPDATE.bat
+```powershell
+.\STRATA-TUI.bat
 ```
 
-## The files
+or:
 
-- **manager.env** — `STRATA_ROOT`, `STRATA_API`, `MANAGER_PORT`.  Everything reads
-  this; no path is hard-coded elsewhere.
-- **manager-models.json** — the external identity map.  Each key is the friendly
-  model/API id (`qwen3.8-flash-next-q2_0-abliterated`), with the config file
-  (`strata-q2_0-abliterated.json`), the GGUF folder, the display name, the family /
-  size / variant label, and the alias list.  The official server already answers
-  aliases from the config; this file adds the naming that official `setup.py` no
-  longer carries.
-- **manager_identity.py** — `reconcile()` merges official `setup.choices_from_config`
-  with manager-models.json; `prepare_variant` is the external custom-GGUF install
-  (it runs the **official** setup.py and then converts the result to the variant's
-  own config + pack, restoring the canonical install); `apply_settings` edits one
-  variant config directly; `child_flags` keeps nvidia-smi etc. console-free.
-## Install / update launcher
+```powershell
+python STRATA-TUI.py
+```
 
-The repository's existing `INSTALL.ps1` and `UPDATE.ps1` remain available for
-installing/updating the terminal launcher in a Strata checkout. They only copy
-`STRATA-TUI.py` and `STRATA-TUI.bat`; the Manager itself runs from this
-repository using `START-MANAGER.bat`.
+## Install
+
+```powershell
+git clone https://github.com/Ayshinko/strata-tui.git
+cd strata-tui
+powershell -ExecutionPolicy Bypass -File .\INSTALL.ps1
+```
+
+An existing Strata installation is required. INSTALL creates a Start Menu shortcut to this checkout; it does not copy files into or modify Strata's source tree.
+
+## Update
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\UPDATE.ps1
+```
+
+Strata itself continues to use its own normal update process.
+
+## Goal
+
+Make Strata easier to configure, launch, tune, monitor, stop, and switch — with minimal overhead and without interfering with Strata updates.
