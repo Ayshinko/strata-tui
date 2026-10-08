@@ -1,32 +1,37 @@
-# --- secrets / local state -------------------------------------------------
-*.local
-.secrets
-.env
+# Runtime output and generated Python files
+logs/
+*.log
+__pycache__/
+*.py[cod]
+.strata-tui.json
+*.pid
+*.state
 
-# --- model artifacts (never committed) -------------------------------------
-models/
+# Local machine configuration and credentials
+manager.env
+.env
+.env.*
+!.env.example
+manager-models.json
+
+# Temporary files, backups, and model data
+*.bak*
+*.tmp*
 *.gguf
 packs/
-/mtp/
 
-# --- Strata-generated files -------------------------------------------------
+# Strata-generated artifacts / local development
 strata-*.json
 strata-*.log
-strata-tui.log
 run-*.bat
 run-*.sh
 engine/
-__pycache__/
-*.pyc
-*.pyo
 .venv/
-
-# --- backups ----------------------------------------------------------------
-*.bak
-*.bak-*
-
-# --- editor / OS ------------------------------------------------------------
 .vscode/
 .idea/
 Thumbs.db
 .DS_Store
+*.local
+.secrets
+models/
+mtp/
