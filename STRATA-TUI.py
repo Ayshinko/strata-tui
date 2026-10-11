@@ -65,6 +65,8 @@ RUNTIME_FILE = Path(tempfile.gettempdir()) / (
 )
 LOG_FILE = TUI_DIR / "logs" / "strata-tui.log"
 DEFAULT_CONTEXT = 65536
+DEFAULT_KV_VRAM = 32768
+DEFAULT_KV_RAM = 32768
 
 try:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -216,6 +218,52 @@ def save_settings(data: dict):
         SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def _kv_allocation_key(item) -> str:
+    """Stable per-config key in the existing per-user TUI settings file."""
+    try:
+        return str(Path(item.path).expanduser().resolve()).casefold()
+    except (OSError, TypeError, ValueError):
+        return str(item.path).casefold()
+
+
+def load_kv_allocation(item) -> dict | None:
+    allocations = load_settings().get("kv_allocations")
+    if not isinstance(allocations, dict):
+        return None
+    value = allocations.get(_kv_allocation_key(item))
+    if not isinstance(value, dict):
+        return None
+    vram, ram = value.get("kv_vram"), value.get("kv_ram")
+    if (isinstance(vram, int) and not isinstance(vram, bool) and vram >= 0 and
+            isinstance(ram, int) and not isinstance(ram, bool) and ram >= 0):
+        return {"kv_vram": vram, "kv_ram": ram,
+                "context": vram + ram}
+    return None
+
+
+def save_kv_allocation(item, kv_vram: int, kv_ram: int) -> None:
+    """Persist allocations on explicit Load, alongside existing user settings."""
+    settings = load_settings()
+    allocations = settings.get("kv_allocations")
+    if not isinstance(allocations, dict):
+        allocations = {}
+    allocations[_kv_allocation_key(item)] = {
+        "kv_vram": kv_vram, "kv_ram": kv_ram,
+        "context": kv_vram + kv_ram,
+    }
+    settings["kv_allocations"] = allocations
+    save_settings(settings)
+
+
+def initial_kv_allocation(item) -> dict:
+    """Use this model's saved choice, or the product's ordinary 32K + 32K default."""
+    saved = load_kv_allocation(item)
+    if saved is not None:
+        return saved
+    return {"kv_vram": DEFAULT_KV_VRAM, "kv_ram": DEFAULT_KV_RAM,
+            "context": DEFAULT_KV_VRAM + DEFAULT_KV_RAM}
 
 
 def default_model_root() -> Path:
@@ -1461,7 +1509,7 @@ def load_options_frame(item, ctx, vision, reserve, kv_vram, estimate, pos: int) 
     if estimate is None:
         est_text = DIM + est_text + RESET
     rows = [
-        ("Context", f"{ctx:>10,}"),
+        ("TOTAL CONTEXT", f"{ctx:>10,}"),
         ("Vision", vision),
         ("VRAM reserve", f"[ {reserve:>6,} ] MiB"),
         ("KV in VRAM", f"[ {kv_vram:>7,} ]"),
@@ -1482,11 +1530,13 @@ def load_options_frame(item, ctx, vision, reserve, kv_vram, estimate, pos: int) 
 
 
 def load_options_page(item, ctx, vision, reserve, kv_vram, calibration) -> tuple:
-    """Edit temporary load settings; Back/Esc returns without any write."""
+    """Edit temporary settings; context is the sum of editable KV allocations."""
     row_count = 8
     pos = 0
+    kv_ram = _vram.kv_ram(ctx, kv_vram)
     kv_format = _vram.model_kv_format(item.cfg or {})
     while True:
+        ctx = _vram.kv_total(kv_vram, kv_ram)
         estimate = _vram.estimate_experts(ctx, kv_vram, reserve, kv_format, calibration)
         paint(load_options_frame(item, ctx, vision, reserve, kv_vram, estimate, pos))
         key = (read_key() or "").lower()
@@ -1495,7 +1545,7 @@ def load_options_page(item, ctx, vision, reserve, kv_vram, calibration) -> tuple
         elif key == "down":
             pos = (pos + 1) % row_count
         elif key in ("esc", "b"):
-            return ("back", vision, reserve, kv_vram)
+            return ("back", vision, reserve, kv_vram, ctx)
         elif key == "enter":
             if pos == 1:
                 new = choose_vision_page(vision)
@@ -1508,19 +1558,20 @@ def load_options_page(item, ctx, vision, reserve, kv_vram, calibration) -> tuple
                     reserve = new
             elif pos == 3:
                 new = _vram_prompt_int("KV IN VRAM (tokens)", kv_vram, "",
-                                       lambda value: _vram.validate_kv_vram(ctx, value))
+                                       _vram.validate_kv_vram)
                 if new is not None:
                     kv_vram = new
+                    ctx = _vram.kv_total(kv_vram, kv_ram)
             elif pos == 4:
-                current_ram = _vram.kv_ram(ctx, kv_vram)
-                new = _vram_prompt_int("KV IN RAM (tokens)", current_ram, "",
-                                       lambda value: _vram.validate_kv_ram(ctx, value))
+                new = _vram_prompt_int("KV IN RAM (tokens)", kv_ram, "",
+                                       _vram.validate_kv_ram)
                 if new is not None:
-                    kv_vram = _vram.reconcile_kv_vram(ctx, new)
+                    kv_ram = new
+                    ctx = _vram.kv_total(kv_vram, kv_ram)
             elif pos == 6:
-                return ("load", vision, reserve, kv_vram)
+                return ("load", vision, reserve, kv_vram, ctx)
             elif pos == 7:
-                return ("back", vision, reserve, kv_vram)
+                return ("back", vision, reserve, kv_vram, ctx)
 
 
 def build_load_plan(item, ctx, vision, current_ctx, current_vision):
@@ -1561,10 +1612,9 @@ def _variant_settings_cmd(item, ctx, vision) -> list[str]:
     return cmd
 
 
-def build_vram_settings_cmd(item, cfg, kv_vram, reserve) -> list[str]:
-    """Build the final, VRAM-only config edit.  It deliberately omits context
-    and Vision so it can run after setup.py without reapplying either setting."""
-    kv_arg, reserve_arg = _vram.effective_args(cfg, kv_vram, reserve)
+def build_vram_settings_cmd(item, cfg, kv_vram, reserve, context=None) -> list[str]:
+    """Build the final residency/reserve edit after context setup has completed."""
+    kv_arg, reserve_arg = _vram.effective_args(cfg, kv_vram, reserve, context=context)
     cmd = [normal_python(), str(TUI_DIR / "manager_identity.py"),
            "--apply-settings", "--root", str(ROOT), "--config", item.path.name,
            "--kv-resident", str(kv_arg),
@@ -1644,16 +1694,19 @@ def start_via_options(item):
     cfg = item.cfg or {}
     current_ctx = config_context(cfg)
     current_vision = config_vision(cfg)
-    ctx = current_ctx or DEFAULT_CONTEXT
     vision = current_vision or "Off"
     reserve = _vram.model_reserve_mib(cfg)
-    kv_vram = _vram.model_kv_vram(cfg, ctx)
+    allocation = initial_kv_allocation(item)
+    ctx = allocation["context"]
+    kv_vram = allocation["kv_vram"]
     calibration = _vram.calibration_from_log(cfg.get("log") or "")
 
-    action, vision, reserve, kv_vram = load_options_page(
+    action, vision, reserve, kv_vram, ctx = load_options_page(
         item, ctx, vision, reserve, kv_vram, calibration)
     if action != "load":
         return
+    kv_ram = ctx - kv_vram
+    save_kv_allocation(item, kv_vram, kv_ram)
 
     port = cfg_port(cfg)
     model_name = cfg.get("model_name") or item.path.stem
@@ -1670,8 +1723,10 @@ def start_via_options(item):
                           "nothing was changed", port, sources=[LOG_FILE])
         return
     current_kv_arg, current_reserve_arg = _vram.effective_args(
-        cfg, _vram.model_kv_vram(cfg, ctx), _vram.model_reserve_mib(cfg))
-    selected_kv_arg, selected_reserve_arg = _vram.effective_args(cfg, kv_vram, reserve)
+        cfg, _vram.model_kv_vram(cfg, current_ctx), _vram.model_reserve_mib(cfg),
+        context=current_ctx)
+    selected_kv_arg, selected_reserve_arg = _vram.effective_args(
+        cfg, kv_vram, reserve, context=ctx)
     vram_changed = ((selected_kv_arg, selected_reserve_arg) !=
                     (current_kv_arg, current_reserve_arg))
     pre_commands = []
@@ -1679,7 +1734,7 @@ def start_via_options(item):
         pre_commands.append(setup_cmd)
     # Always apply explicit VRAM choices after setup when setup may rewrite defaults.
     if setup_cmd or vram_changed:
-        pre_commands.append(build_vram_settings_cmd(item, cfg, kv_vram, reserve))
+        pre_commands.append(build_vram_settings_cmd(item, cfg, kv_vram, reserve, context=ctx))
     if pre_commands:
         backup = _vram_backup(item.path)
         if backup:
@@ -1711,7 +1766,8 @@ def _vram_prompt_int(label, current, unit, ok):
             v = int(raw)
         except ValueError:
             v = None
-        if v is None or not ok(v):
+        accepted = v is not None and ok(v)
+        if not accepted:
             print(RED + f"{raw!r} is not a valid value here." + RESET)
             print(DIM + "Press any key to try again, or B / Esc to cancel." + RESET)
             if (read_key() or "").lower() in ("b", "esc"):

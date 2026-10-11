@@ -79,11 +79,32 @@ class Invariant(unittest.TestCase):
             self.assertEqual(kv_vram + kv_ram, 65536)
             self.assertEqual(vram.kv_ram(65536, kv_vram), kv_ram)
 
+    def test_large_context_ram_input_validation(self):
+        ctx = 262144
+        resident = 32768
+        ram = 229376
+        self.assertTrue(vram.validate_kv_ram(ctx, ram))
+        self.assertEqual(vram.reconcile_kv_vram(ctx, ram), resident)
+        self.assertEqual(vram.kv_ram(ctx, resident), ram)
+        self.assertFalse(vram.validate_kv_ram(ctx, -1))
+        self.assertTrue(vram.validate_kv_ram(ctx, ctx + 1))
+        for value in (32768, 65536):
+            self.assertTrue(vram.validate_kv_ram(ctx, value))
+            self.assertTrue(vram.validate_kv_vram(ctx, value))
+
+    def test_unbounded_allocations_and_summed_total(self):
+        self.assertTrue(vram.validate_kv_ram(917504))
+        self.assertTrue(vram.validate_kv_vram(131072))
+        self.assertTrue(vram.validate_kv_ram(10**30))
+        self.assertEqual(vram.kv_total(131072, 917504), 1048576)
+        self.assertEqual(vram.kv_total(65536, 458752), 524288)
+
     def test_validation(self):
         ctx = 65536
         self.assertFalse(vram.validate_kv_vram(ctx, -1))
-        self.assertFalse(vram.validate_kv_vram(ctx, ctx + 1))
+        self.assertTrue(vram.validate_kv_vram(ctx, ctx + 1))
         self.assertFalse(vram.validate_kv_vram(ctx, 1.5))
+        self.assertFalse(vram.validate_kv_vram(ctx, -1))
         self.assertTrue(vram.validate_kv_vram(ctx, 0))
         self.assertTrue(vram.validate_kv_vram(ctx, ctx))
 

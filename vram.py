@@ -114,37 +114,50 @@ def kv_ram(context, kv_vram: int) -> int:
 
 
 def reconcile_kv_vram(context, kv_ram: int) -> int:
-    """Keep the invariant when the user edits KV in RAM instead of KV in VRAM."""
+    """Legacy inverse helper: VRAM implied by total context and RAM."""
     return (context or 0) - (kv_ram or 0)
 
 
-def kv_total(context) -> int:
-    return context or 0
+def kv_total(kv_vram, kv_ram=None) -> int:
+    """Total context is the sum of the independently editable KV allocations.
+
+    The one-argument form remains compatible with older callers that passed an
+    already-computed total.
+    """
+    if kv_ram is None:
+        return kv_vram or 0
+    return (kv_vram or 0) + (kv_ram or 0)
 
 
 def _whole(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def validate_kv_vram(context, value) -> bool:
-    ctx = context or 0
-    return _whole(value) and 0 <= value <= ctx
+def validate_kv_vram(context, value=None) -> bool:
+    """Validate only the input's integer syntax and non-negative allocation.
+
+    Accepts the legacy (context, value) call shape; context is intentionally not
+    used to cap the editable allocation.
+    """
+    v = value if value is not None else context
+    return _whole(v) and v >= 0
 
 
-def validate_kv_ram(context, value) -> bool:
-    ctx = context or 0
-    return _whole(value) and 0 <= value <= ctx
+def validate_kv_ram(context, value=None) -> bool:
+    """Validate only a non-negative integer; the old total is not a ceiling."""
+    v = value if value is not None else context
+    return _whole(v) and v >= 0
 
 
 def validate_reserve_mib(value) -> bool:
     return _whole(value) and value >= 0
 
 
-def effective_args(cfg: dict, kv_vram: int, reserve_mib: int) -> tuple:
+def effective_args(cfg: dict, kv_vram: int, reserve_mib: int, context=None) -> tuple:
     """What to persist.  Returns (kv_resident_arg, reserve_arg): kv_resident_arg is
     the --kv-resident value, or 0 when the KV is fully resident (drop it); None
     when the screen did not change it.  --kv and --expert-cache are never touched."""
-    ctx = model_context(cfg) or 0
+    ctx = context if context is not None else (model_context(cfg) or 0)
     if kv_vram is None:
         kv_arg = None
     elif kv_vram < ctx:
