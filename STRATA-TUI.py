@@ -144,7 +144,12 @@ def paint(text: str):
     afterwards just moves home, writes the frame and erases leftover rows."""
     global CLEAR_NEXT
     prefix = "\x1b[2J\x1b[H" if CLEAR_NEXT else "\x1b[H"
-    sys.stdout.write(prefix + text + "\x1b[J")
+    # Clear every rendered row before advancing; CSI J only clears below the cursor.
+    # This prevents stale suffixes from longer prior frames surviving in-line.
+    frame = "\n".join(line + "\x1b[K" for line in text.splitlines())
+    if text.endswith("\n"):
+        frame += "\n"
+    sys.stdout.write(prefix + frame + "\x1b[J")
     sys.stdout.flush()
     CLEAR_NEXT = False
 
