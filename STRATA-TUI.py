@@ -333,7 +333,35 @@ def arg_value(args: list, key: str) -> str | None:
 #   - the engine:       the --mtp draft runtime (dense.txt, dense.bin, experts.bin)
 # Only file existence is tested - never the tens-of-GB payloads.
 
-def config_ready(cfg: dict) -> tuple[bool, list[str]]:
+def config_ready(cfg: dict, config_path: Path | None = None) -> tuple[bool, list[str]]:
+    if cfg.get("arch") in {d.get("arch") for d in official_families().values() if d.get("arch")}:
+        if config_path is None:
+            return False, ["Own-engine readiness requires its saved config path"]
+        try:
+            from strata_control import doctor
+            report = doctor.inspect(config_path)
+            problems = [f"{p['name']}: {p.get('path') or p.get('reason', 'missing')}"
+                        for p in report['components']
+                        if p.get('required') and p['status'] in ('missing', 'invalid')]
+            if cfg.get("arch") == "deepseek41" and not problems:
+                args = list(cfg.get("args") or [])
+                raw_pack = arg_value(args, "--pack")
+                if not raw_pack:
+                    problems.append("DeepSeek config has no --pack path")
+                else:
+                    exe = doctor._location(cfg['exe'], cfg, config_path)
+                    pack = doctor._location(raw_pack, cfg, config_path)
+                    if exe.name.lower() not in ('strata-dsv41.exe', 'strata-dsv41'):
+                        problems.append("DeepSeek requires the separate strata-dsv41 engine")
+                    elif not (pack / 'tensors.txt').is_file() or not (pack / 'ds4.txt').is_file():
+                        problems.append(f"DeepSeek pack is incomplete: {pack} (ds4.txt / tensors.txt missing)")
+                    else:
+                        good, why = strata_setup.dsv41_pack_info(exe, pack, cfg.get('lib_dirs'))
+                        if not good:
+                            problems.append("DeepSeek pack check: " + why.strip()[-600:])
+            return not problems, problems
+        except Exception as exc:
+            return False, [f"Official component check: {exc}"]
     problems: list[str] = []
     args = list(cfg.get("args") or [])
 
@@ -410,6 +438,18 @@ def config_source_gguf(cfg: dict) -> Path | None:
         p = Path(shard)
         if p.parent.is_dir():
             return p.parent
+    if cfg.get('arch') == 'deepseek41':
+        pack = arg_value(list(cfg.get('args') or []), '--pack')
+        if pack:
+            try:
+                with (Path(pack) / 'ds4.txt').open(encoding='utf-8') as manifest:
+                    for line in manifest.read(65536).splitlines():
+                        if line.startswith('model_dir '):
+                            source = Path(line[len('model_dir '):].strip())
+                            if source.is_dir():
+                                return source
+            except OSError:
+                pass
     return None
 
 
@@ -452,6 +492,74 @@ def _metadata_int(md: dict, key: str) -> int | None:
     return int(v) if isinstance(v, (int, float)) else None
 
 
+def validate_own_headers(folder: Path, family: str, model: str) -> HeaderCheck:
+    """Published own-engine sets: official header readers + pinned sizes.
+
+    This is compatibility discovery, not provenance attestation. Official setup
+    still verifies SHA-256 and the backend's pack/smoke checks on Prepare.
+    """
+    definition = official_families()[family]
+    details = official_models(family)[model]
+    names = details.get("shards")
+    if not isinstance(names, list):
+        names = [definition["file"].format(q=model, i=1)]
+    pick = getattr(strata_setup, "dsv41_pick", lambda d, n: d / n)
+    shards = [pick(folder, n) for n in names]
+    arch = definition.get("arch")
+    try:
+        from strata_control.gguf_preflight import inspect_metadata
+        parsed = []
+        summary = Counter()
+        tensors = 0
+        for i, path in enumerate(shards):
+            if not path.is_file():
+                raise ValueError(f"missing shard: {path.name}")
+            pins = definition.get("sha256", {})
+            pin = pins.get(path.name)
+            if pin is None or path.stat().st_size != pin[0]:
+                raise ValueError(f"{path.name}: size does not match the official pinned file")
+            if arch == "deepseek41":
+                # The generic preflight does not know DeepSeek's integer Engram
+                # metadata or MXFP8. Use this backend's installed pack reader.
+                from tools.dsv41 import pack_gguf as backend
+                g = backend.Gguf(path)
+                if g.version != 3:
+                    raise ValueError("DeepSeek requires GGUF v3")
+                problem = backend.short(g)
+                if problem:
+                    raise ValueError(problem)
+                md = g.kv
+                types = Counter()
+                for name, typ, dims, offset in g.tensors:
+                    if typ not in backend.TYPES and typ not in (26, 27):
+                        raise ValueError(f"{path.name}: unsupported DeepSeek tensor type {typ}")
+                    if "_exps" in name:
+                        if typ not in backend.TYPES:
+                            raise ValueError(f"{path.name}: unsupported expert encoding {typ}")
+                        types[backend.TYPES[typ][0]] += 1
+                report = {"architecture": md.get("general.architecture"),
+                          "expert_tensor_types": dict(types), "tensor_count_scanned": len(g.tensors)}
+            else:
+                report = inspect_metadata(path)
+                md = GGUFFile(path).metadata
+            if i == 0 and report.get("architecture") != arch:
+                raise ValueError(f"Architecture is {report.get('architecture')!r}; {family} requires {arch!r}")
+            if report.get("architecture") not in (None, arch):
+                raise ValueError(f"{path.name}: inconsistent architecture")
+            if len(shards) > 1 and (md.get("split.no") != i or md.get("split.count") != len(shards)):
+                raise ValueError(f"{path.name}: inconsistent split metadata")
+            parsed.append(md)
+            summary.update(report["expert_tensor_types"])
+            tensors += report["tensor_count_scanned"]
+        if not summary:
+            raise ValueError("No routed expert tensors in the published model set")
+        md = parsed[0]
+        return HeaderCheck(True, model, arch, _metadata_int(md, arch + ".expert_count"),
+                           _metadata_int(md, arch + ".expert_used_count"), tensors, dict(summary))
+    except (Exception, SystemExit) as exc:
+        return HeaderCheck(False, model, arch, None, None, 0, {}, str(exc))
+
+
 def validate_gguf_headers(folder: Path, family: str, filename_model: str | None) -> HeaderCheck:
     """Validate a candidate using Strata's own GGUF header reader.
 
@@ -463,6 +571,9 @@ def validate_gguf_headers(folder: Path, family: str, filename_model: str | None)
       - every shard is long enough for its tensor directory
       - expert tensor quantization, when it directly maps to a Strata model size
     """
+    definition = official_families()[family]
+    if "models" in definition:
+        return validate_own_headers(folder, family, filename_model)
     fam = strata_setup.FAMILIES[family]
     model_for_paths = filename_model or "Q2_0"
     shards = strata_setup.gguf_dir_shards(folder, fam, model_for_paths)
@@ -607,15 +718,56 @@ def config_identity(path: Path) -> tuple[str | None, str | None, str | None, int
     (its stem ends in a variant label)."""
     try:
         c = manager_identity.reconcile(path.name, strata_setup.choices_from_config(path))
+        if not c.get('family') or not c.get('model'):
+            # Some installer versions uppercase a mixed-case catalog key (Gyro-S)
+            # and fail their own lookup. Match only an exact official config tag.
+            for family, definition in official_families().items():
+                for model in official_models(family):
+                    tag = 'strata-' + definition.get('tag', '') + model
+                    if path.stem.casefold() == tag.casefold():
+                        c['family'], c['model'] = family, model
         return c.get("family"), c.get("model"), c.get("variant"), c.get("context")
     except Exception:
         return None, None, None, None
 
 
+def official_families() -> dict:
+    """All installer routes, not only Flash-Next's packed GGUF families."""
+    return {**getattr(strata_setup, "FAMILIES", {}),
+            **getattr(strata_setup, "OWN_PATH_FAMILIES", {}),
+            **getattr(strata_setup, "MULTI_FILE_FAMILIES", {})}
+
+
+def official_models(family: str) -> dict:
+    definition = official_families().get(family, {})
+    if "models" in definition:
+        return definition["models"]
+    return {m: d for m, d in strata_setup.MODELS.items()
+            if family in d.get("families", ("qwen", "swift"))}
+
+
+def official_file_identity(first: Path) -> tuple[str, str] | None:
+    """Only published base-model names; Engram/drafters are not model choices."""
+    for family, definition in official_families().items():
+        if definition.get("ready"):
+            continue
+        for model, details in official_models(family).items():
+            shards = details.get("shards")
+            if isinstance(shards, list):
+                names = [shards[0]] if shards else []
+                names += [getattr(strata_setup, "DSV41_LEGACY_NAMES", {}).get(n) for n in names[:]]
+            elif "file" in definition:
+                names = [definition["file"].format(q=model, i=1) if "models" in definition
+                         else strata_setup.model_file(definition, model, 1)]
+            else:
+                names = []
+            if first.name in names:
+                return family, model
+    return None
+
+
 def family_title(family: str | None) -> str:
-    if family and family in strata_setup.FAMILIES:
-        return strata_setup.FAMILIES[family].get("title", family)
-    return family or "Unknown"
+    return official_families().get(family, {}).get("title", family or "Unknown")
 
 
 def config_title(cfg: dict, family, model, variant, context) -> str:
@@ -644,7 +796,7 @@ def installed_configs(conf_root: Path | None = None) -> list[Item]:
             context = context or config_context(cfg)
             title = config_title(cfg, family, model, variant, context)
 
-            ready, problems = config_ready(cfg)
+            ready, problems = config_ready(cfg, p)
             if ready:
                 items.append(Item("config", title, "READY", p, cfg=cfg,
                                   family=family, model=model, variant=variant, context=context,
@@ -652,6 +804,12 @@ def installed_configs(conf_root: Path | None = None) -> list[Item]:
                 continue
 
             source = config_source_gguf(cfg)
+            if official_families().get(family, {}).get('ready'):
+                repo_name = official_models(family)[model].get('repo', '').replace('/', '--')
+                raw_pack = arg_value(list(cfg.get('args') or []), '--pack')
+                if repo_name and raw_pack:
+                    source = next((p.parent for p in Path(raw_pack).parents
+                                   if p.name == repo_name and p.parent.is_dir()), source)
             if source is not None:
                 # One clear PREPARE row: re-running the CURRENT setup.py rebuilds
                 # exactly what is missing, keeping the config's identity (variant!).
@@ -683,6 +841,9 @@ def quant_from_name(name: str) -> str | None:
 
 
 def infer_family(folder: Path, first: Path, model: str) -> str | None:
+    identity = official_file_identity(first)
+    if identity:
+        return identity[0]
     allowed = tuple(strata_setup.MODELS.get(model, {}).get("families", ("qwen", "swift")))
     hay = (folder.name + " " + first.name).lower()
 
@@ -708,7 +869,7 @@ def variant_hint(folder: Path, first: Path, family: str, model: str) -> str | No
     that used to require a patched setup.py).  None for the exact published name."""
     fam = strata_setup.FAMILIES[family]
     try:
-        canonical = fam["file"].format(q=model, i=1)
+        canonical = strata_setup.model_file(fam, model, 1)
     except Exception:
         canonical = ""
     if first.name == canonical:
@@ -772,10 +933,20 @@ def gguf_items(root: Path, covered_keys: set[tuple]) -> tuple[list[Item], list[I
 
     for folder in top_level_model_folders(root):
         for first in gguf_first_files(folder):
-            filename_model = quant_from_name(first.name)
+            identity = official_file_identity(first)
+            auxiliary_family = next((f for f, d in official_families().items()
+                                     if any(first.name in (n, getattr(strata_setup, 'DSV41_LEGACY_NAMES', {}).get(n))
+                                            for md in d.get('models', {}).values() for n in md.get('shared', []))), None)
+            if auxiliary_family and not identity:
+                unsupported.append(Item('auxiliary', first.name, 'AUXILIARY', folder,
+                                        family=auxiliary_family, first_gguf=first,
+                                        reason=f'Official shared artifact for {family_title(auxiliary_family)}; not a base model. '
+                                               'Strata resolves it during preparation.'))
+                continue
+            filename_model = identity[1] if identity else quant_from_name(first.name)
             family_guess_model = filename_model if filename_model in strata_setup.MODELS else "Q2_0"
-            family = infer_family(folder, first, family_guess_model)
-            if not family or family not in strata_setup.FAMILIES:
+            family = identity[0] if identity else infer_family(folder, first, family_guess_model)
+            if not family or family not in official_families():
                 unsupported.append(Item(
                     "gguf", first.name, "UNSUPPORTED", folder,
                     reason="Cannot identify a supported Strata family",
@@ -793,7 +964,7 @@ def gguf_items(root: Path, covered_keys: set[tuple]) -> tuple[list[Item], list[I
                 continue
 
             model = check.model
-            if not model or model not in strata_setup.MODELS:
+            if not model or model not in official_models(family):
                 unsupported.append(Item(
                     "gguf", first.name, "UNSUPPORTED", folder,
                     reason=f"Header is valid qwen4exp, but quant/model {model or '?'} is not supported "
@@ -802,7 +973,8 @@ def gguf_items(root: Path, covered_keys: set[tuple]) -> tuple[list[Item], list[I
                 ))
                 continue
 
-            allowed = tuple(strata_setup.MODELS[model].get("families", ("qwen", "swift")))
+            allowed = (family,) if "models" in official_families()[family] else tuple(
+                strata_setup.MODELS[model].get("families", ("qwen", "swift")))
             if family not in allowed:
                 unsupported.append(Item(
                     "gguf", first.name, "UNSUPPORTED", folder,
@@ -811,7 +983,7 @@ def gguf_items(root: Path, covered_keys: set[tuple]) -> tuple[list[Item], list[I
                 ))
                 continue
 
-            var = variant_hint(folder, first, family, model)
+            var = None if "models" in official_families()[family] else variant_hint(folder, first, family, model)
             if (family, model, var) in covered_keys:
                 continue
 
@@ -825,6 +997,25 @@ def gguf_items(root: Path, covered_keys: set[tuple]) -> tuple[list[Item], list[I
                 f"experts={check.expert_count}, expert types={expert_summary}"
             )
 
+            if family in getattr(strata_setup, 'MULTI_FILE_FAMILIES', {}):
+                reason = f'Native preparation required ({check.architecture}); SHA-256 verification and pack check pending.'
+                if check.architecture == 'deepseek41':
+                    from types import SimpleNamespace
+                    args = SimpleNamespace(gguf_dir=str(folder), models_dir=str(ROOT / 'models'))
+                    definition = official_families()[family]
+                    shared_dir = strata_setup.dsv41_shared_dir(args, definition)
+                    pending = []
+                    if strata_setup.dsv41_exe(ROOT / 'engine') is None:
+                        pending.append('separate DeepSeek engine')
+                    for name in official_models(family)[model].get('shared', []):
+                        artifact = strata_setup.dsv41_find_shared(args, name, folder, shared_dir)
+                        if not artifact.is_file():
+                            pending.append(name)
+                    reason += (' Engram/DSpark shared inputs missing: ' + ', '.join(pending)
+                               if pending else ' Engram/DSpark shared inputs present; official verification still required.')
+                    if pending:
+                        reason += '; official setup may download these prerequisites.'
+
             supported.append(Item(
                 "gguf", title, "PREPARE", folder,
                 family=family, model=model, variant=var,
@@ -832,6 +1023,29 @@ def gguf_items(root: Path, covered_keys: set[tuple]) -> tuple[list[Item], list[I
             ))
 
     return supported, unsupported
+
+
+def ready_pack_items(root: Path, covered_keys: set[tuple]) -> list[Item]:
+    """Catalog-defined non-GGUF inputs (NVFP4/QAD); no recursive weight scan."""
+    items = []
+    for family, definition in official_families().items():
+        if not definition.get('ready'):
+            continue
+        for model in official_models(family):
+            if (family, model, None) in covered_keys:
+                continue
+            files = strata_setup.ready_needed(model, root)
+            paths = [(strata_setup.ready_where(root, f), f) for f in files]
+            prepared = strata_setup.prepared_done(model, root) if strata_setup.MODELS[model].get('prepare') else False
+            if not prepared and not any(p.is_file() for p, _ in paths):
+                continue
+            missing = [p.name for p, f in paths if not p.is_file() or p.stat().st_size != f[4]]
+            reason = ('Official local pack inputs; ' +
+                      (f'{len(missing)} missing/incomplete file(s); setup may download required files: ' + ', '.join(missing[:3])
+                       if missing else 'files present; official setup still verifies hashes and prepares the config'))
+            items.append(Item('pack', f'{family_title(family)} {model}', 'PREPARE', root,
+                              family=family, model=model, reason=reason))
+    return items
 
 
 def all_items(model_root: Path, show_unsupported: bool, conf_root: Path | None = None) -> tuple[list[Item], int]:
@@ -842,7 +1056,7 @@ def all_items(model_root: Path, show_unsupported: bool, conf_root: Path | None =
         if x.status in ("READY", "PREPARE") and x.family and x.model
     }
     supported, unsupported = gguf_items(model_root, covered)
-    items = configs + supported
+    items = configs + supported + ready_pack_items(model_root, covered)
     if show_unsupported:
         items += unsupported
     return items, len(unsupported)
@@ -866,6 +1080,23 @@ def prepare_command(item: Item) -> list[str]:
     the canonical names, the helper converts the result into the variant's own config + pack and
     restores the canonical install - setup.py is never patched, nothing is duplicated."""
     gguf_dir = item.prepare_dir or item.path
+    if official_families().get(item.family, {}).get('ready'):
+        return [normal_python(), str(ROOT / 'setup.py'),
+                '--family', item.family, '--model', item.model,
+                '--models-dir', str(gguf_dir),
+                *(['--context', str(item.context)] if item.context else []),
+                '--no-start', '--yes']
+    if "models" in official_families().get(item.family, {}):
+        # Own-engine installers own their defaults and integrity/pack recipe.
+        # Never force the Flash-Next 64K or variant wrapper onto another backend.
+        raw_pack = arg_value(list((item.cfg or {}).get('args') or []), '--pack')
+        data_dir = Path(raw_pack).parent.parent if raw_pack else None
+        return [normal_python(), str(ROOT / "setup.py"),
+                "--family", item.family, "--model", item.model,
+                "--gguf-dir", str(gguf_dir),
+                *(["--data-dir", str(data_dir)] if data_dir else []),
+                *(["--context", str(item.context)] if item.context else []),
+                "--no-start", "--yes"]
     ctx = item.context or DEFAULT_CONTEXT
     contexts = list(getattr(strata_setup, "CONTEXTS", [DEFAULT_CONTEXT]))
     if 65536 in contexts:
@@ -975,6 +1206,24 @@ def start_item(item: Item) -> tuple[subprocess.Popen, int] | None:
     ]
 
     kwargs = dict(cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT)
+    if item.family == 'deepseek41':
+        import deepseek_settings as ds
+        try:
+            ds.validate_copy_config(item.cfg)
+        except ValueError as error:
+            log.close()
+            append_log('Incompatible engine configuration: ' + str(error))
+            return None
+        budget = ds.flag_value(ds.effective(item.cfg), '--expert-copy-gb')
+        if budget is not None and budget != 'auto':
+            if not getattr(item, '_copy_budget_session_confirmed', False):
+                log.close()
+                append_log('Manual Copy Budget not armed: use Performance > Load & Start and confirm risk.')
+                return None
+            item._copy_budget_session_confirmed = False
+            env = os.environ.copy()
+            env['DS4_MANUAL_COPY_SESSION'] = '1'  # child only; never saved to JSON or system environment
+            kwargs['env'] = env
 
     if os.name == "nt":
         si = subprocess.STARTUPINFO()
@@ -999,8 +1248,15 @@ def start_item(item: Item) -> tuple[subprocess.Popen, int] | None:
         except Exception:
             pass
 
+    try:
+        from strata_control import procs
+        identity = procs.identify(p.pid)
+    except Exception:
+        identity = None
     runtime_save({
         "pid": p.pid,
+        "process_token": identity.token if identity else None,
+        "process_cmd": list(identity.cmd) if identity else None,
         "port": port,
         "config": str(item.path),
         "model_name": item.cfg.get("model_name") or item.path.stem,
@@ -1019,6 +1275,17 @@ def stop_owned():
     pid = int(rt.get("pid", 0) or 0)
     port = int(rt.get("port", 8080) or 8080)
     expected = rt.get("model_name")
+    token, command = rt.get('process_token'), rt.get('process_cmd')
+    try:
+        from strata_control import procs
+        same = bool(token and command and procs.is_same(pid, token, command))
+    except Exception:
+        same = False
+    if not same:
+        append_log('Nothing stopped: TUI process identity is absent or stale; '
+                   'a server owned by official Strata is left running. Use its owner to stop it.')
+        runtime_clear()
+        return
     h = health(port)
 
     if h and expected and h.get("model") not in (expected, None):
@@ -1041,7 +1308,7 @@ def stop_owned():
                 timeout=12, creationflags=flags
             )
             time.sleep(1.5)
-            if health(port):
+            if health(port) and procs.is_same(pid, token, command):
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1050,7 +1317,7 @@ def stop_owned():
         else:
             os.killpg(pid, signal.SIGTERM)
             time.sleep(1.5)
-            if health(port):
+            if health(port) and procs.is_same(pid, token, command):
                 os.killpg(pid, signal.SIGKILL)
 
         runtime_clear()
@@ -1360,7 +1627,7 @@ def render_menu(items: list[Item], pos: int, model_root: Path, unsupported_count
         for i, item in enumerate(items):
             mark = ">" if i == pos else " "
             col = status_color(item.status)
-            source = "CONFIG" if item.kind == "config" else "GGUF"
+            source = {'config': 'CONFIG', 'gguf': 'GGUF', 'pack': 'PACK', 'auxiliary': 'AUX'}.get(item.kind, item.kind.upper())
             lines.append(
                 f"{BOLD if i == pos else ''}{mark} "
                 f"{item.title[:64]:64} "
@@ -1378,10 +1645,10 @@ def render_menu(items: list[Item], pos: int, model_root: Path, unsupported_count
 
     if unsupported_count:
         state = "shown" if show_unsupported else "hidden"
-        lines.append(DIM + f"  {unsupported_count} unsupported GGUF item(s) {state} · press U to toggle" + RESET)
+        lines.append(DIM + f"  {unsupported_count} non-launchable item(s) {state} · press U to toggle" + RESET)
 
     lines.append("")
-    lines.append("↑/↓ Select   Enter Start/Prepare   R Refresh   X Stop   C Chat   M Monitor   F Folder   U Unsupported   Q Quit")
+    lines.append("↑/↓ Select   Enter Start/Prepare   R Refresh   X Stop   C Chat   M Monitor   B Benchmark   F Folder   U Unsupported   Q Quit")
     paint("\n".join(lines) + "\n")
 
 
@@ -1684,8 +1951,11 @@ class LoadRunner:
             return None
         if self.phase == "fail":
             return ("ERROR", "settings update did not start - see the log", None)
+        live = health(self.port)
+        if live and live.get('model') not in (None, self.model_name()):
+            return ('ERROR', f":{self.port} is serving {live.get('model')}; {self.model_name()} not started", self.port)
         if self.serve is False:
-            if health(self.port):
+            if live:
                 return ("RUNNING", self.model_name(), self.port)
             return ("ERROR", "start did not begin - see the log", self.port)
         proc, port = self.serve
@@ -1694,8 +1964,442 @@ class LoadRunner:
         return ("ERROR", f"start exited ({proc.poll()}) while loading - see the log", port)
 
 
+def cell_clip(text: str, width: int) -> str:
+    """Bound a backend screen by terminal cells without splitting ANSI codes."""
+    import unicodedata
+    tokens = re.findall(r'\x1b\[[0-9;?]*[A-Za-z]|.', text)
+    sizes = [0 if t.startswith('\x1b') or unicodedata.combining(t) else
+             2 if unicodedata.east_asian_width(t) in ('W', 'F') else 1 for t in tokens]
+    if sum(sizes) <= width:
+        return text
+    out, used = [], 0
+    for token, size in zip(tokens, sizes):
+        if used + size > max(0, width - 1):
+            break
+        out.append(token)
+        used += size
+    return ''.join(out) + '…' + (RESET if '\x1b' in text else '')
+
+
+def deepseek_input(prompt):
+    """Small raw-key editor so Esc cancels without waiting for Enter on Windows."""
+    if not sys.stdin.isatty():
+        try:
+            value = input(prompt)
+            return None if '\x1b' in value else value
+        except (EOFError, KeyboardInterrupt):
+            return None
+    value = ''
+    while True:
+        width = max(1, shutil.get_terminal_size((120, 40)).columns - 2)
+        sys.stdout.write('\r' + cell_clip(prompt + value, width) + '\x1b[K')
+        sys.stdout.flush()
+        key = read_key() or ''
+        if key.lower() == 'esc' or key == '\x03':
+            return None
+        if key.lower() == 'enter':
+            return value
+        if key in ('\b', '\x7f'):
+            value = value[:-1]
+        elif len(key) == 1 and key.isprintable() and len(value) < 64:
+            value += key
+
+
+def deepseek_confirm(title, text):
+    """A small yes/no frame; Enter confirms the first choice, Esc/B keeps editing."""
+    width = max(1, shutil.get_terminal_size((120, 40)).columns - 2)
+    import textwrap
+    pos = 0
+    request_clear()
+    while True:
+        lines = [BOLD + title + RESET, '']
+        lines += textwrap.wrap(text, width)
+        lines += ['', ('> ' if pos == 0 else '  ') + 'Yes',
+                  ('> ' if pos == 1 else '  ') + 'No',
+                  '', '↑/↓ Select   Enter Confirm   Esc Cancel']
+        paint('\n'.join(cell_clip(line, width) for line in lines) + '\n')
+        key = (read_key() or '').lower()
+        if key in ('up', 'down'):
+            pos = 1 - pos
+        elif key in ('enter', 'y'):
+            return pos == 0
+        elif key in ('esc', 'b', 'n'):
+            return False
+
+
+def deepseek_edit_field(args, changes, label, flag, ds, width):
+    """One option's value editor.  Esc discards ALL pending edits; blank keeps the current
+    value.  Returns 'discard' on Esc (whole page abandoned), otherwise None."""
+    import textwrap
+    error = ''
+    while True:
+        current = changes.get(flag, ds.current_value(args, flag))
+        lines = [BOLD + label.upper() + RESET, '']
+        lines += textwrap.wrap(ds.HELP[flag], width)
+        lines += textwrap.wrap(error, width) if error else ['']
+        lines += textwrap.wrap('Blank = keep current; cancel = return. auto = omit the flag '
+                               '(only --dspark and --mmap-experts take the literal auto).', width)
+        paint('\n'.join(cell_clip(line, width) for line in lines) + '\n')
+        raw = deepseek_input('Value [' + ds.display_value(flag, current) + ']: ')
+        request_clear()
+        if raw is None:
+            return 'discard'
+        raw = raw.strip()
+        if not raw or raw.lower() == 'cancel':
+            return None
+        try:
+            value = ds.parse_value(flag, raw)
+        except ValueError as exc:
+            error = 'Invalid: ' + str(exc)
+            continue
+        if value == ds.current_value(args, flag):
+            changes.pop(flag, None)
+        else:
+            changes[flag] = value
+        return None
+
+
+def deepseek_save(item, changes, ds):
+    """Write the pending edits with a verified backup, mark Restart Required and never
+    restart.  Refuses to touch a foreign model serving the config's port."""
+    cfg = item.cfg or {}
+    port = cfg_port(cfg)
+    live = health(port)
+    if live and live.get('model') not in (None, cfg.get('model_name')):
+        return False, RED + f"ERROR: :{port} is serving {live.get('model')}; nothing saved" + RESET
+    if not changes and not cfg.get('tui_deepseek_reload_required'):
+        return True, 'Nothing changed since the last save.'
+    try:
+        new_cfg, _updated = ds.persist(item, changes, running=True)
+    except (OSError, ValueError, TypeError) as exc:
+        return False, RED + 'Save failed: ' + str(exc) + RESET
+    item.cfg = new_cfg
+    return True, 'Saved. Restart Required until the engine reloads — nothing was restarted.'
+
+
+def deepseek_load_options_page(item):
+    """DeepSeek Performance settings screen.  Every option shows the effective value;
+    Auto means the flag is omitted (the engine's own default).  Actions: Save (marks
+    Restart Required, never restarts), Load & Start (returns the pending changes so the
+    caller starts the engine), Reset to Default, Reload Configuration, Back.  Unsaved
+    edits are never silently dropped: Esc and Back ask first."""
+    import deepseek_settings as ds
+    cfg = item.cfg or {}
+    args = ds.effective(cfg)
+    changes = {}
+    notice = ''
+    pos = 0
+    actions = ['Save', 'Load & Start', 'Reset to Default', 'Reload Configuration', 'Back']
+    fields = ds.fields_for_config(cfg)
+    while True:
+        width = max(1, shutil.get_terminal_size((120, 40)).columns - 2)
+        status = (RED + BOLD + '● Restart Required' + RESET if cfg.get('tui_deepseek_reload_required')
+                  else YELLOW + '● Unsaved changes' + RESET if changes
+                  else GREEN + '● Saved' + RESET)
+        lines = [BOLD + 'STRATA — DEEPSEEK PERFORMANCE' + RESET, '', item.title,
+                 '  Engine: ' + str(cfg.get('exe') or '') + '   ' + status,
+                 '', BOLD + '  Performance settings' + RESET]
+        for i, (label, flag) in enumerate(fields):
+            if i == len(ds.PERFORMANCE):
+                lines += ['', BOLD + '  Advanced' + RESET]
+            value = changes.get(flag, ds.current_value(args, flag))
+            lines.append(('> ' if pos == i else '  ') + label + ': ' + ds.display_value(flag, value))
+        lines += ['', BOLD + '  Actions' + RESET]
+        for i, label in enumerate(actions, len(fields)):
+            lines.append(('> ' if pos == i else '  ') + label)
+        if notice:
+            lines += ['', CYAN + notice + RESET]
+        lines += ['', '←/→ choices · Enter edit/confirm · ↑/↓ select · Esc Back',
+                  'Save marks Restart Required and never restarts; edits are pending until saved.']
+        paint('\n'.join(cell_clip(line, width) for line in lines) + '\n')
+        key = (read_key() or '').lower()
+        total = len(fields) + len(actions)
+        if key in ('up', 'down'):
+            pos = (pos + (1 if key == 'down' else -1)) % total
+            notice = ''
+        elif key in ('left', 'right') and pos < len(fields):
+            label, flag = fields[pos]
+            if flag in ds.ENUMS:                  # dropdown-style cycling for the choices
+                base = ds.current_value(args, flag)
+                choices = ds.ENUMS[flag]
+                index = choices.index(changes.get(flag, base)) if changes.get(flag, base) in choices else 0
+                index = (index + (1 if key == 'right' else -1)) % len(choices)
+                value = choices[index]
+                if value == base:
+                    changes.pop(flag, None)
+                else:
+                    changes[flag] = value
+                notice = ''
+        elif key in ('esc', 'b'):
+            if changes and not deepseek_confirm('DISCARD EDITS',
+                    'There are unsaved changes. Discard them all and leave the settings?'):
+                continue
+            return None
+        elif key == 'enter':
+            if pos < len(fields):
+                label, flag = fields[pos]
+                if deepseek_edit_field(args, changes, label, flag, ds, width) == 'discard':
+                    return None
+                notice = ''
+                continue
+            action = actions[pos - len(fields)]
+            if action == 'Back':
+                if changes and not deepseek_confirm('DISCARD EDITS',
+                        'There are unsaved changes. Discard them all and leave the settings?'):
+                    continue
+                return None
+            if action == 'Save':
+                saved, notice = deepseek_save(item, changes, ds)
+                if saved:
+                    cfg = item.cfg
+                    args = ds.effective(cfg)
+                    changes = {}
+            elif action == 'Load & Start':
+                try:
+                    pending = ds.edited_config(cfg, changes)
+                    ds.validate_copy_config(pending)
+                    budget = ds.flag_value(ds.effective(pending), '--expert-copy-gb')
+                    if budget is not None and budget != 'auto' and not deepseek_confirm(
+                            'HIGH MEMORY RISK', 'Manual expert copies can exhaust RAM and freeze Windows. '
+                            'Start this experiment now? No boot/autostart is configured.'):
+                        continue
+                except (ValueError, OSError) as error:
+                    notice = str(error)
+                    continue
+                item._copy_budget_session_confirmed = budget is not None and budget != 'auto'
+                return changes
+            elif action == 'Reset to Default':
+                changes = {flag: ds.default_option(flag) for _, flag in fields}
+                notice = 'All options set to their engine defaults — Save to apply.'
+            elif action == 'Reload Configuration':
+                if changes and not deepseek_confirm('DISCARD EDITS',
+                        'Discard unsaved changes and reload the saved configuration from disk?'):
+                    continue
+                cfg = read_json(item.path)
+                item.cfg = cfg
+                args = ds.effective(cfg)
+                changes = {}
+                notice = 'Configuration reloaded from disk.'
+
+
+
+def benchmark_detail(item, record):
+    import deepseek_bench as bench
+    offset = 0
+    notice = ''
+    while True:
+        height = max(6, shutil.get_terminal_size((120, 40)).lines - 8)
+        import textwrap
+        width = max(30, shutil.get_terminal_size((120, 40)).columns - 2)
+        lines = [part for line in bench.detail_lines(record)
+                 for part in (textwrap.wrap(line, width=width, replace_whitespace=False) or [''])]
+        offset = max(0, min(offset, max(0, len(lines) - height)))
+        paint('\n'.join([BOLD + 'STRATA — SNAPSHOT DETAILS' + RESET, ''] +
+                        lines[offset:offset + height] + ['', notice,
+                        '↑/↓ Scroll · R Restore Configuration · D Delete Snapshot · B/Esc Back']) + '\n')
+        key = (read_key() or '').lower()
+        if key in ('esc', 'b'):
+            return
+        if key in ('up', 'down'):
+            offset += 1 if key == 'down' else -1
+        elif key == 'r' and deepseek_confirm('RESTORE CONFIGURATION',
+                'Restore verified performance launch parameters? Current JSON will be backed up. No engine restart.'):
+            try:
+                paths = bench.restore_result(item, record)
+                notice = 'Restored; Restart Required (not restarted). Backup: ' + str(Path(item.path).parent / '.deepseek-backups')
+            except Exception as error:
+                notice = str(error)
+        elif key == 'd' and deepseek_confirm('DELETE SNAPSHOT', 'Delete this snapshot from History? Original data remains archived in JSONL.'):
+            try:
+                bench.delete_result(record)
+                return
+            except OSError as error:
+                notice = str(error)
+
+
+def benchmark_page(item):
+    """DeepSeek benchmark screen.  Reads the engine's own logged numbers (decode/prefill
+    tok/s, expert-cache store statistics, VRAM placement), samples the engine's RAM, shows
+    the configuration under test, and keeps a saved history for comparison.  Everything is
+    manual: nothing runs, restarts or writes to the engine here."""
+    import deepseek_settings as ds
+    import deepseek_bench as bench
+    cfg = item.cfg or {}
+    log = Path(cfg.get('log') or '')
+    notice = ''
+    pos = 0
+    actions = ['Snapshot & Save Result', 'Refresh Stats', 'Back']
+    while True:
+        stats = bench.parse_log(log) if log.is_file() else {}
+        cfg = item.cfg or {}
+        memory = bench.memory_snapshot(cfg)
+        results = bench.visible_results()
+        pos = min(pos, len(actions) + len(results) - 1)
+        best = bench.best_decode(results)
+        width = max(60, min(150, shutil.get_terminal_size((120, 40)).columns - 2))
+        lines = [BOLD + 'STRATA — DEEPSEEK BENCHMARK' + RESET, '', item.title,
+                 '  Engine: ' + bench.engine_version(cfg) + '   log: ' + (log.name if log else '—'),
+                 '', BOLD + '  Current run (from the engine log)' + RESET]
+        decode = stats.get('decode_tok_s')
+        prefill = stats.get('prefill_tok_s')
+        lines.append('  Decode          ' +
+                     (f'{decode:>8.2f} tok/s' if isinstance(decode, (int, float)) else '—'))
+        lines.append('  Prefill         ' +
+                     (f'{prefill:>8.1f} tok/s' if isinstance(prefill, (int, float)) else '—'))
+        lines.extend(bench.memory_lines(memory))
+        vram_used = None
+        if 'vram_weights_gb' in stats and 'vram_experts_gb' in stats:
+            vram_used = stats['vram_weights_gb'] + stats['vram_experts_gb'] + stats.get('vram_caches_gb', 0)
+        lines.append('  VRAM used       ' +
+                     (f'{vram_used:>8.2f} GB (weights + experts + caches)' if vram_used is not None else '—'))
+        if 'vram_free_mib' in stats:
+            lines.append(f"  VRAM free       {stats['vram_free_mib']:>8d} MiB (CUDA0, after reserve)")
+        cpu = stats.get('cpu_lane_pct')
+        if cpu is not None:
+            lines.append(f"  CPU lane        {cpu:>8.1f}% of the experts")
+        if stats.get('ram_store_gb') is not None or stats.get('store'):
+            lines += ['  Expert memory store (engine reported):']
+            if stats.get('ram_store_gb') is not None:
+                store_policy = {0: 'lru', 1: 'lfu', 2: 'lfulru'}.get(stats.get('ram_store_policy'), '?')
+                lines.append(f"    RAM store: {stats.get('ram_store_slots', '?')} slots · "
+                             f"{stats['ram_store_gb']:.1f} GB cap · policy {store_policy}")
+            if 'store_warm_experts' in stats:
+                lines.append(f"    warm-up: {stats['store_warm_experts']} of the profile's hottest "
+                             f"experts ({stats['store_warm_gb']:.1f} GB)")
+            store = stats.get('store')
+            if store:
+                lines.append(f"    {store['hits_pct']:.1f}% of the CPU lane's experts were in RAM · "
+                             f"{store['read_mb_per_token']:.1f} MB read a token")
+                lines.append(f"    slots {store['slots']} of {store['slots_max']} · "
+                             f"{store['evictions']} evictions · {store['failed_reads']} failed reads")
+        lines += ['', BOLD + '  Configuration under test' + RESET]
+        launch = bench.launch_evidence(cfg.get('log'))
+        lines.extend('  ' + line for line in bench.configuration_lines(launch.get('args') or [], stats))
+        lines += ['', BOLD + '  History · L latest / D best Decode / P best Prefill · Enter Details' + RESET,
+                  '      Time Decode Prefill Context DSpark GPU Experts CPU Copy GB']
+        lines += ['  Snapshot JSON: ' + str(bench.results_path().resolve())] + bench.comparison(results)
+        if not results:
+            lines.append('  No saved results yet — Snapshot & Save Result records one.')
+        else:
+            selected = max(0, pos - len(actions))
+            first = max(0, selected - 5)
+            for index, record in enumerate(results[first:first + 6], first):
+                is_best = (isinstance(record.get('decode_tok_s'), (int, float)) and best is not None
+                           and abs(record['decode_tok_s'] - best) < 1e-9)
+                best_pf = max((r['prefill_tok_s'] for r in results if isinstance(r.get('prefill_tok_s'), (int, float))), default=None)
+                marks = ('L' if index == 0 else '-') + ('D' if is_best else '-') + ('P' if best_pf is not None and record.get('prefill_tok_s') == best_pf else '-')
+                line = marks + ' ' + bench.result_row(record, width - 6)
+                if is_best:
+                    line = GREEN + line + RESET
+                lines.append(('> ' if pos == len(actions) + index else '  ') + cell_clip(line, width))
+        lines += ['', BOLD + '  Actions' + RESET]
+        for i, label in enumerate(actions):
+            lines.append(('> ' if pos == i else '  ') + label)
+        if notice:
+            lines += ['', CYAN + notice + RESET]
+        lines += ['', 'Enter Confirm · R Refresh · B/Esc Back',
+                  'Benchmark is manual: it never runs or restarts the engine.']
+        paint('\n'.join(cell_clip(line, width) for line in lines) + '\n')
+        key = (read_key() or '').lower()
+        if key in ('up', 'down'):
+            pos = (pos + (1 if key == 'down' else -1)) % (len(actions) + len(results))
+            notice = ''
+        elif key in ('r',):
+            notice = 'Stats re-read from the engine log.'
+        elif key in ('esc', 'b'):
+            return
+        elif key == 'enter':
+            if pos >= len(actions):
+                benchmark_detail(item, results[pos - len(actions)])
+                continue
+            if pos == 0:
+                record = bench.save_result(cfg)
+                if record is None:
+                    notice = RED + 'Could not write the results file.' + RESET
+                else:
+                    decode_text = ('%.2f tok/s' % record['decode_tok_s']) \
+                        if isinstance(record.get('decode_tok_s'), (int, float)) else '—'
+                    notice = f"Saved result {record.get('ts', '')} · decode {decode_text} · " \
+                             f"prefill {record.get('prefill_tok_s') or '—'}"
+            elif pos == 1:
+                notice = 'Stats refreshed.'
+            else:
+                return
+
+
+def own_load_options_page(item) -> bool:
+    """Own engines retain their native saved settings, never Qwen KV formulas."""
+    cfg = item.cfg or {}
+    args = list(cfg.get('args') or [])
+    ctx = config_context(cfg)
+    pos = 0
+    while True:
+        lines = [BOLD + 'STRATA — LOAD MODEL' + RESET, '', item.title, '',
+                 f"  Context              {ctx:,}" if ctx else '  Context              Engine default',
+                 f"  Engine               {Path(cfg.get('exe') or '').name}",
+                 '  Memory / experts     Engine-managed',
+                 f"  Drafting             {arg_value(args, '--dspark') or arg_value(args, '--mtp') or 'Engine default'}",
+                 '', '  Saved backend settings are kept unchanged.',
+                 '  Use official Strata settings to tune this backend.', '',
+                 ('> ' if pos == 0 else '  ') + 'Load',
+                 ('> ' if pos == 1 else '  ') + 'Back', '',
+                 '↑/↓ Select   Enter Confirm   Esc Back']
+        width = max(20, shutil.get_terminal_size((120, 40)).columns - 2)
+        paint('\n'.join(cell_clip(line, width) for line in lines) + '\n')
+        key = (read_key() or '').lower()
+        if key in ('up', 'down'):
+            pos = 1 - pos
+        elif key in ('esc', 'b'):
+            return False
+        elif key == 'enter':
+            return pos == 0
+
+
 def start_via_options(item):
     """READY + Enter: load-options page first; only 'Load' actually starts."""
+    if item.family == 'deepseek41' and (item.cfg or {}).get('arch') == 'deepseek41':
+        changes = deepseek_load_options_page(item)
+        if changes is None:
+            return
+        cfg = item.cfg or {}
+        port = cfg_port(cfg)
+        live = health(port)
+        if live and live.get('model') not in (None, cfg.get('model_name')):
+            log_page('ERROR', f":{port} is serving {live.get('model')}; nothing saved or started", port)
+            return
+        try:
+            import deepseek_settings as ds
+            item.cfg, updated = ds.persist(item, changes, running=bool(live))
+            item.context = config_context(item.cfg)
+        except (OSError, ValueError, TypeError) as exc:
+            log_page('ERROR', 'DeepSeek settings not applied: ' + str(exc), port)
+            return
+        if live:
+            if changes or item.cfg.get('tui_deepseek_reload_required'):
+                log_page('RELOAD REQUIRED', 'Settings saved for next start; not applied to the running model. '
+                         'Stop/reload using its owner (official Terminal or this TUI). Nothing was stopped.', port)
+            else:
+                log_page('RUNNING', cfg.get('model_name') or item.title, port)
+            return
+        runner = LoadRunner(item)
+        cfg = item.cfg or {}
+        log_page('LOADING', cfg.get('model_name') or item.title, port,
+                 extra=ctx_label(config_context(cfg)), sources=[LOG_FILE],
+                 active=runner.alive, finished=runner.finish,
+                 banner=f'==== MODEL READY · http://127.0.0.1:{port} ====')
+        return
+    if "models" in official_families().get(item.family, {}):
+        if not own_load_options_page(item):
+            return
+        cfg = item.cfg or {}
+        runner = LoadRunner(item)
+        port = cfg_port(cfg)
+        sources = [LOG_FILE] + ([Path(cfg['log'])] if cfg.get('log') else [])
+        log_page('LOADING', cfg.get('model_name') or item.title, port,
+                 extra=ctx_label(config_context(cfg)), sources=sources,
+                 active=runner.alive, finished=runner.finish,
+                 banner=f'==== MODEL READY · http://127.0.0.1:{port} ====')
+        return
     cfg = item.cfg or {}
     current_ctx = config_context(cfg)
     current_vision = config_vision(cfg)
@@ -1715,9 +2419,15 @@ def start_via_options(item):
 
     port = cfg_port(cfg)
     model_name = cfg.get("model_name") or item.path.stem
-    if health(port):
-        log_page("RUNNING", model_name, port,
-                 banner=f"==== MODEL READY · http://127.0.0.1:{port} ====")
+    live = health(port)
+    if live:
+        actual = live.get('model') or 'unknown'
+        if actual != model_name:
+            log_page('ERROR', f':{port} is serving {actual}; {model_name} not started', port,
+                     sources=[LOG_FILE])
+        else:
+            log_page("RUNNING", model_name, port,
+                     banner=f"==== MODEL READY · http://127.0.0.1:{port} ====")
         return
 
     setup_cmd = build_load_plan(item, ctx, vision, current_ctx, current_vision)
@@ -1821,7 +2531,9 @@ def main():
                     pname = f"{family_title(item.family)} {item.model}"
                     if item.variant:
                         pname += f" · {item.variant}"
-                    extra = f"{(item.context or DEFAULT_CONTEXT) // 1024}K"
+                    extra = (ctx_label(item.context) if item.context else
+                             'Backend default' if 'models' in official_families().get(item.family, {})
+                             else ctx_label(DEFAULT_CONTEXT))
                     log_page(
                         "PREPARING", pname, None, extra=extra,
                         sources=[LOG_FILE],
@@ -1865,6 +2577,23 @@ def main():
             open_strata("#chat", items)
         elif key == "m":
             open_strata("#monitor", items)
+        elif key == "b":
+            request_clear()
+            target = None
+            if items:
+                cur = items[pos]
+                if cur.kind == "config" and cur.family == "deepseek41" and cur.status == "READY":
+                    target = cur
+                else:
+                    for cand in items:
+                        if cand.kind == "config" and cand.family == "deepseek41" and cand.status == "READY":
+                            target = cand
+                            break
+            if target is None:
+                log_page("ERROR", "No installed READY DeepSeek 4.1 config to benchmark",
+                         None, sources=[])
+            else:
+                benchmark_page(target)
         elif key == "f":
             model_root = choose_model_root(model_root)
             items, unsupported_count = all_items(model_root, show_unsupported)

@@ -10,7 +10,7 @@ param()
 
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
-foreach ($name in @("STRATA-TUI.py", "STRATA-TUI.bat", "manager_config.py", "manager_identity.py", "vram.py")) {
+foreach ($name in @("STRATA-TUI.py", "STRATA-TUI.bat", "manager_config.py", "manager_identity.py", "vram.py", "deepseek_settings.py", "deepseek_bench.py", "manager.env.example")) {
     if (-not (Test-Path (Join-Path $Repo $name))) {
         throw "Missing STRATA-TUI file in checkout: $name"
     }
