@@ -368,6 +368,14 @@ def config_ready(cfg: dict, config_path: Path | None = None) -> tuple[bool, list
     exe = cfg.get("exe")
     if not exe:
         problems.append("the config has no \"exe\"")
+    elif str(exe).startswith("component:"):
+        try:
+            from strata_control import engine_component
+            resolved = engine_component.expand(exe, cfg, full=False)
+            if not Path(resolved).is_file():
+                problems.append(f"the engine is missing: {resolved}")
+        except Exception as exc:
+            problems.append(f"Official engine component check: {exc}")
     elif not Path(exe).is_file():
         problems.append(f"the engine is missing: {exe}")
 

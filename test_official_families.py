@@ -113,6 +113,30 @@ class OfficialFamilies(unittest.TestCase):
         item.model = 'Q8_0'
         self.assertEqual(tui.prepare_command(item)[cmd.index('--context') + 1], '16384')
 
+    def test_qwen_component_reference_uses_official_resolution_without_changing_config(self):
+        import copy
+        from strata_control import engine_component as ec
+        pack = self.tmp / 'component-pack'
+        tokenizer = pack / 'tokenizer'
+        tokenizer.mkdir(parents=True)
+        (pack / 'native_experts.txt').write_text('fixture')
+        for name in ('vocab.json', 'merges.txt', 'token_type.json'):
+            (tokenizer / name).write_text('{}')
+        exe = self.tmp / 'strata.exe'
+        exe.write_bytes(b'fixture - never executed')
+        cfg = {'exe': 'component:strata-engine', 'args': ['--pack', str(pack)],
+               'tokenizer': str(tokenizer)}
+        original = copy.deepcopy(cfg)
+        with patch.object(ec, 'expand', return_value=str(exe)) as resolve:
+            ready, problems = tui.config_ready(cfg)
+        self.assertTrue(ready, problems)
+        resolve.assert_called_once_with('component:strata-engine', cfg, full=False)
+        self.assertEqual(cfg, original)
+        with patch.object(ec, 'expand', side_effect=ec.EngineMissing('missing component', self.tmp)):
+            ready, problems = tui.config_ready(cfg)
+        self.assertFalse(ready)
+        self.assertTrue(any('missing component' in p for p in problems), problems)
+
     def test_own_engine_config_readiness_uses_backend_artifacts(self):
         import json
         exe = self.tmp / 'strata-dsv41.exe'
