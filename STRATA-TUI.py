@@ -2978,7 +2978,7 @@ def settings_page(path: Path):
                 fid = deepseek_input("New profile file name (letters, digits, . _ -; e.g. long-chat; Esc cancels): ")
                 if fid is None:
                     continue
-                title = deepseek_input("Shown name (e.g. 长对话; Enter = file name): ", max_len=120)
+                title = deepseek_input("Shown name (e.g. Long chat; Enter = file name): ", max_len=120)
                 new_name = (title or "").strip() or fid.strip()
                 target = PROFILES_DIR / f"{fid.strip()}.json"
             out = json.loads(json.dumps(prof))
