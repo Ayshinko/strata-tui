@@ -19,10 +19,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ENV_FILE = HERE / "manager.env"
 
-KEYS = ("STRATA_ROOT", "STRATA_API", "MANAGER_PORT")
+KEYS = ("STRATA_ROOT", "STRATA_API", "MANAGER_PORT", "STRATA_COMPONENTS_DIR", "STRATA_TUI_PROFILES", "STRATA_TUI_STATE",
+        "STRATA_TUI_VERIFIED")
 DEFAULTS = {k: "" for k in KEYS}
 DEFAULT_PORT = 8275
 DEFAULT_API = "http://127.0.0.1:8080"
+#: your own launch profiles and the TUI's generated run configs and logs: outside the Strata folder, so an update never touches them
+DEFAULT_PROFILES = r"C:\AI\strata-tui\profiles" if os.name == "nt" else "~/.local/share/strata-tui/profiles"
+DEFAULT_STATE = r"C:\AI\strata-tui\state" if os.name == "nt" else "~/.local/share/strata-tui/state"
 
 
 def _parse_env(text: str) -> dict:
@@ -75,3 +79,25 @@ def manager_port() -> int:
 
 def strata_api() -> str:
     return load()["STRATA_API"] or DEFAULT_API
+
+
+def components_dir() -> Path:
+    """Strata's component folder (the engine packages and components/.updates/state.json)."""
+    value = load().get("STRATA_COMPONENTS_DIR", "").strip()
+    return Path(value).expanduser() if value else strata_root() / "components"
+
+
+def profiles_dir() -> Path:
+    """Your own launch profiles (STRATA_TUI_PROFILES)."""
+    return Path(load().get("STRATA_TUI_PROFILES", "").strip() or DEFAULT_PROFILES).expanduser()
+
+
+def state_dir() -> Path:
+    """The TUI's generated run configs, engine logs and remembered engine version (STRATA_TUI_STATE)."""
+    return Path(load().get("STRATA_TUI_STATE", "").strip() or DEFAULT_STATE).expanduser()
+
+
+def verified_dir() -> Path:
+    """The read-only copy of the verified settings (STRATA_TUI_VERIFIED; default: beside the profiles folder)."""
+    value = load().get("STRATA_TUI_VERIFIED", "").strip() if "STRATA_TUI_VERIFIED" in KEYS else ""
+    return Path(value).expanduser() if value else profiles_dir().parent / "verified"

@@ -15,6 +15,10 @@ STRATA-TUI makes Strata easier to use without adding another heavy management la
 - View live loading and runtime logs
 - Open Chat and Monitor directly
 - Automatically use the capabilities of the installed Strata version
+- Your own launch profiles, outside the Strata folder, that a Strata update or setup run cannot rewrite
+- Refusal-vector control per profile (on/off, strength, layers, built-in or your own vector)
+- A check before each start: when the engine version changed, how Strata's own launch files now differ from your profile
+- A live line on the main menu: the drafter really running (DFlash2 / MTP), the refusal vector, tok/s, and whether the engine's command line matches the profile
 
 ## Lightweight by design
 
@@ -182,6 +186,76 @@ Windows memory samples require a verified process identity; unavailable samples
 stay Unknown, and ambiguous legacy RAM values are marked untrusted in Details.
 `psutil` in the chosen Python environment is needed for process sampling; without
 it the page remains usable but cannot report process memory.
+
+## Profiles
+
+A profile is one JSON file in your profiles folder (`STRATA_TUI_PROFILES` in `manager.env`, default
+`C:\AI\strata-tui\profiles`). It is never inside the Strata folder, so `UPDATE.bat`, `START-HERE.bat --setup` and
+Strata's launcher cannot rewrite it. On the first start the folder gets the shipped default
+(`profiles-default/qwen3.8-iq3s-dflash2.json`); an existing file is never replaced.
+
+Profiles are the first rows of the menu (`PROFILE`). Enter opens one:
+
+- **Enter** starts it. The TUI writes a run config of its own (`<STRATA_TUI_STATE>\run\<profile>.json`, engine log in
+  `...\logs\`) and starts Strata's `serve/server.py` with it, because the engine itself has no HTTP API.
+- **T / K / L / V / P**: the refusal vector on/off, its strength, its layers, its file (`builtin` or a path), and whether a
+  request has it on unless it says otherwise. Saved to the profile (the old file is kept as `.json.bak`), used at the next start.
+- **A** saves a copy under a new name (a DFlash2 one, an MTP one, another model...).
+
+How the profile's values survive Strata's own start logic: every engine option is written to both `args` and
+`user_args` (Strata puts `user_args` over what it generates, and its drafting policy and memory fit keep values found
+there), `drafting` is the profile's, and the server starts with `STRATA_NO_PRESET=1` so no saved Strata tuning is put
+on top. With `"drafting": "dflash2"` Strata still names the drafter pack itself; the live line compares the engine's
+real command line with the profile after every start and lists any difference.
+
+**The verified profile** (`qwen3.8-iq3s-dflash2.json`) is read-only: it cannot be saved over or deleted, and the TUI
+keeps the file's read-only attribute set. Change its settings in the settings menu and save them with **A** as a new profile.
+The reference copy of the verified settings is `C:\AI\strata-tui\verified\qwen3.8-iq3s-dflash2.json` (read-only,
+`STRATA_TUI_VERIFIED`); the settings menu compares every profile with it.
+
+**Delete**: `Del` on a profile row moves the file (and its `.json.bak`) to `<profiles>\_deleted\` with a time stamp,
+after a confirmation that shows the path. Move it back to restore it. A running profile must be stopped first (`X`).
+
+The profile schema is described at the top of `profiles.py`. `--pack`, `--native`, `--ple-gguf` and
+`--expert-profile` go in `model`, the control vector options in `refusal`, everything else verbatim in `args`.
+
+### Refusal vector
+
+The default is Strata's own vector, `data/experimental-speed-projection/` (docs/DETAILS.md, "Experimental speed
+projection"). On, the profile adds
+
+```
+--control-vector-scaled <file>:<strength> --control-vector-layer-range <first> <last> --cvec-mode project --cvec-dir per-layer
+```
+
+In `project` mode the engine removes `strength * (h . v) v` after each layer of the range: 1.0 removes the direction,
+0.5 half of it. Its package describes the vector as a refusal-direction projection: the model declines far fewer
+requests (a safety behaviour is removed) and its answers shift slightly; Strata measured 0.2-0.4% more time per token.
+A request can switch it with `"experimental_speed_projection": false` (or `true`). It is off in the default profile.
+
+### Settings menu
+
+`E` on a profile row (or in the profile page) opens every option of the profile: context and KV (`--max-context`,
+`--kv`, `--kv-resident`, `--kv-grow`, `--prefill`), vision (`--vision`, CPU/GPU reader, image tokens), the drafter
+(dflash2 / mtp / off, `--spec`, `--draft-conf`, `--mtp-draft-vocab`), VRAM and experts (`--vram-reserve-mib`,
+`--expert-cache`, `STRATA_ROUTE_PRIOR`), the refusal vector, and the port. Each row shows the current value and the
+verified default (`profiles-default/qwen3.8-iq3s-dflash2.json`); a different value is marked `changed`. The line under the
+list says what the selected option does and costs, and which values it takes.
+
+Enter changes a value (a letter picks a preset), D restores one option, R restores all of them, S saves and A saves a new
+profile (for example `long-chat`, `fast-short`). Saving first shows the full start: the environment, the server command
+and the engine command. When the model running now was started from this profile, the TUI offers to restart it.
+
+Values are checked against the engine and Strata's docs (`src/program/generate.cpp`, `docs/DETAILS.md`); where the source
+gives no limit, the owner's range is used (`settings_spec.py` says which). `--draft-model` and `--draft-fallback` are shown
+but locked: with dflash2, Strata's server picks the pack and writes `--draft-fallback none` itself. Switching the drafter
+to mtp uses Strata setup's MTP values (`--mtp <mtp folder> --spec 4 --spec-min-p 0.5`), which were not verified on this PC.
+
+### Engine updates
+
+Before each start the TUI compares the active engine package with the one it saw last time
+(`<STRATA_TUI_STATE>\engine-seen.json`). When it changed, it lists how `strata-<model>.json`, Strata's launch config
+and its launcher preset differ from your profile. Nothing is changed: Enter starts with your profile, Esc cancels.
 
 ## Tests
 
