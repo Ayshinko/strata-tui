@@ -3,10 +3,8 @@ rem STRATA-TUI - lightweight terminal controls for Strata. Does not modify Strat
 setlocal
 cd /d "%~dp0"
 
-for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0manager.env") do (
-  set "line=%%A"
-  if not "!line:~0,1!"=="#" set "%%A=%%B"
-)
+rem eol=# skips comment lines (the old !line! test needed delayed expansion, which was never enabled)
+for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%~dp0manager.env") do set "%%A=%%B"
 if not defined STRATA_ROOT set "STRATA_ROOT=C:\AI\Runtime\Strata"
 
 rem a console python is required here (the TUI owns the terminal) - prefer the Strata venv

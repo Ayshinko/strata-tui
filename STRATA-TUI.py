@@ -7,8 +7,8 @@ A compact, keyboard-driven terminal interface for an installed Strata checkout:
   model  ->  prepare  ->  start  ->  logs
 
 It does not build a second management stack.  There is no second server, no
-reverse proxy, no daemon, no dashboard repainting the menu in the background,
-and no third-party Python dependency: the launcher draws the screen with plain
+reverse proxy, no daemon, and no third-party Python dependency (the main menu's
+one live line is polled from Strata's own /metrics and engine log); the launcher draws the screen with plain
 ANSI sequences and reuses the official Strata checkout's own logic.
 
 Strata remains the source of truth.  Model support comes from the checkout's
@@ -16,6 +16,9 @@ setup.py (MODELS / FAMILIES / GGUF_QUANT / gguf_dir_shards), GGUF verification
 comes from its tools/gguf_reader.py, and preparation is a subprocess call to its
 setup.py.  If upstream Strata adds or removes a supported quant or family, this
 launcher follows the installed checkout rather than a handwritten whitelist.
+
+Your own launch profiles (profiles.py) are the exception on purpose: they live outside the Strata folder,
+so an update or a setup run cannot rewrite the engine options you verified; Strata's server still runs them.
 
 STRATA-TUI is a standalone companion to Strata. It reads the installed Strata
 capabilities and configuration, and never patches official source files. Custom
@@ -108,7 +111,7 @@ SPINNER_SECONDS = 0.25   # status-bar animation while an operation runs
 
 
 # ---------------------------------------------------------------------------
-# terminal - a static, key-driven screen.  No live dashboard, no frame caches.
+# terminal - a key-driven screen; the main menu repaints only when its text changes.
 
 CLEAR_NEXT = True
 
@@ -158,7 +161,7 @@ def _decode_windows_key(ch: str) -> str:
     import msvcrt
     if ch in ("\x00", "\xe0"):
         ch2 = msvcrt.getwch()
-        return {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}.get(ch2, "")
+        return {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT", "S": "DEL"}.get(ch2, "")
     if ch == "\r":
         return "ENTER"
     if ch == "\x1b":
@@ -167,8 +170,8 @@ def _decode_windows_key(ch: str) -> str:
 
 
 def read_key(timeout: float | None = None) -> str | None:
-    """Read one key.  `timeout` is used only by the operation-log page while a
-    process is active; the main menu always blocks instead of auto-refreshing."""
+    """Read one key, or None after `timeout` seconds (None: wait).  The main menu waits one second at a time so its
+    live line can refresh; the operation-log page uses it while a process is active."""
     if os.name == "nt":
         import msvcrt
         if timeout is None:
@@ -195,6 +198,9 @@ def read_key(timeout: float | None = None) -> str | None:
             ready, _, _ = select.select([sys.stdin], [], [], 0.03)
             if ready:
                 seq = sys.stdin.read(2)
+                if seq == "[3":                      # Delete: ESC [ 3 ~
+                    sys.stdin.read(1)
+                    return "DEL"
                 return {"[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT"}.get(seq, "ESC")
             return "ESC"
         if ch in ("\r", "\n"):
@@ -706,10 +712,10 @@ def validate_gguf_headers(folder: Path, family: str, filename_model: str | None)
 
 @dataclass
 class Item:
-    kind: str                  # config | gguf
+    kind: str                  # profile | config | gguf
     title: str
     status: str                # READY | PREPARE | UNSUPPORTED | BROKEN
-    path: Path
+    path: Path                 # (a profile: the run config the TUI writes for it in the state folder)
     cfg: dict | None = None
     family: str | None = None
     model: str | None = None
@@ -718,6 +724,8 @@ class Item:
     reason: str = ""
     first_gguf: Path | None = None
     prepare_dir: Path | None = None   # the folder to hand setup.py as --gguf-dir
+    profile_path: Path | None = None  # your own profile file (kind "profile")
+    profile: dict | None = None
 
 
 def config_identity(path: Path) -> tuple[str | None, str | None, str | None, int | None]:
@@ -1064,7 +1072,7 @@ def all_items(model_root: Path, show_unsupported: bool, conf_root: Path | None =
         if x.status in ("READY", "PREPARE") and x.family and x.model
     }
     supported, unsupported = gguf_items(model_root, covered)
-    items = configs + supported + ready_pack_items(model_root, covered)
+    items = profile_items() + configs + supported + ready_pack_items(model_root, covered)
     if show_unsupported:
         items += unsupported
     return items, len(unsupported)
@@ -1188,7 +1196,7 @@ def append_log(message: str):
 
 
 def start_item(item: Item) -> tuple[subprocess.Popen, int] | None:
-    if item.kind != "config" or item.status != "READY" or not item.cfg:
+    if item.kind not in ("config", "profile") or item.status != "READY" or not item.cfg:
         append_log("This model is not ready. Prepare it first.")
         return None
 
@@ -1214,6 +1222,11 @@ def start_item(item: Item) -> tuple[subprocess.Popen, int] | None:
     ]
 
     kwargs = dict(cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT)
+    if item.kind == "profile":
+        # your profile is the configuration: no saved Strata tuning is put on top (server.py apply_saved_tuning)
+        env = os.environ.copy()
+        env["STRATA_NO_PRESET"] = "1"
+        kwargs["env"] = env
     if item.family == 'deepseek41':
         import deepseek_settings as ds
         try:
@@ -1233,14 +1246,12 @@ def start_item(item: Item) -> tuple[subprocess.Popen, int] | None:
             env['DS4_MANUAL_COPY_SESSION'] = '1'  # child only; never saved to JSON or system environment
             kwargs['env'] = env
 
+    kwargs["stdin"] = subprocess.DEVNULL
     if os.name == "nt":
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0
-        kwargs["startupinfo"] = si
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
+        # The way Strata's own launcher starts its server (strata_control/runtime.py): no console at all. A hidden console
+        # (CREATE_NEW_CONSOLE + SW_HIDE, used here before) measured ~37% slower decode on 2026-11-06 with the same engine
+        # options and environment: TUI 79.0 vs Strata Terminal 117.6-126.1 tok/s on the same 2169-token first prompt.
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
 
@@ -1268,6 +1279,8 @@ def start_item(item: Item) -> tuple[subprocess.Popen, int] | None:
         "port": port,
         "config": str(item.path),
         "model_name": item.cfg.get("model_name") or item.path.stem,
+        "profile": str(item.profile_path) if item.profile_path else None,
+        "engine_log": item.cfg.get("log"),
     })
 
     append_log(f"Starting {item.cfg.get('model_name', item.path.stem)} on :{port}")
@@ -1599,7 +1612,7 @@ def log_page(kind: str, label: str = "", port=None, extra: str = "",
 
 
 # ---------------------------------------------------------------------------
-# UI - main menu.  Rendered once, redrawn only after a user action.
+# UI - main menu.  Redrawn after a key, or when the running model's live line changes.
 
 def status_color(status: str) -> str:
     return {
@@ -1610,15 +1623,27 @@ def status_color(status: str) -> str:
     }.get(status, "")
 
 
+_LAST_MENU: str | None = None
+
+
 def render_menu(items: list[Item], pos: int, model_root: Path, unsupported_count: int,
-                show_unsupported: bool, notice: str):
-    running = running_status([x for x in items if x.kind == "config"])
+                show_unsupported: bool, notice: str) -> bool:
+    """Builds the menu and paints it when it differs from what is on screen (the live line refreshes it). True when painted."""
+    global _LAST_MENU
+    live = LIVE.get() if LIVE is not None else None
+    if LIVE is None:
+        running = running_status([x for x in items if x.kind == "config"])
+        live = (running[0], running[1], "", []) if running else None
     lines: list[str] = []
 
     lines.append(BOLD + "STRATA" + RESET)
-    if running:
-        port, h = running
+    if live:
+        port, h, line, diffs = live
         lines.append(GREEN + "● Running" + RESET + f"  {h.get('model', 'unknown')}  :{port}")
+        if line:
+            lines.append("  " + (YELLOW if diffs else CYAN) + line + RESET)
+        for d in diffs[:4]:
+            lines.append(YELLOW + "  ! " + d + RESET)
     else:
         lines.append(DIM + "○ Stopped" + RESET)
 
@@ -1635,12 +1660,18 @@ def render_menu(items: list[Item], pos: int, model_root: Path, unsupported_count
         for i, item in enumerate(items):
             mark = ">" if i == pos else " "
             col = status_color(item.status)
-            source = {'config': 'CONFIG', 'gguf': 'GGUF', 'pack': 'PACK', 'auxiliary': 'AUX'}.get(item.kind, item.kind.upper())
+            source = {'profile': 'PROFILE', 'config': 'CONFIG', 'gguf': 'GGUF', 'pack': 'PACK',
+                      'auxiliary': 'AUX'}.get(item.kind, item.kind.upper())
+            refusal = ""
+            if item.kind == "profile" and item.profile:
+                r = item.profile["refusal"]
+                refusal = (f"  {YELLOW}refusal-vector ON x{float(r['scale']):g}{RESET}" if r["enabled"]
+                           else f"  {DIM}refusal-vector off{RESET}")
             lines.append(
                 f"{BOLD if i == pos else ''}{mark} "
                 f"{item.title[:64]:64} "
                 f"{col}{item.status:11}{RESET} "
-                f"{DIM}{source}{RESET}"
+                f"{DIM}{source}{RESET}{refusal}"
             )
 
     lines.append("")
@@ -1656,8 +1687,13 @@ def render_menu(items: list[Item], pos: int, model_root: Path, unsupported_count
         lines.append(DIM + f"  {unsupported_count} non-launchable item(s) {state} · press U to toggle" + RESET)
 
     lines.append("")
-    lines.append("↑/↓ Select   Enter Start/Prepare   R Refresh   X Stop   C Chat   M Monitor   B Benchmark   F Folder   U Unsupported   Q Quit")
-    paint("\n".join(lines) + "\n")
+    lines.append("↑/↓ Select   Enter Profile/Start/Prepare   E Settings   Del Delete profile   R Refresh   X Stop   C Chat   M Monitor   B Benchmark   F Folder   U Unsupported   Q Quit")
+    frame = "\n".join(lines) + "\n"
+    if frame == _LAST_MENU and not CLEAR_NEXT:
+        return False
+    paint(frame)
+    _LAST_MENU = frame
+    return True
 
 
 def choose_model_root(current: Path) -> Path:
@@ -1989,7 +2025,7 @@ def cell_clip(text: str, width: int) -> str:
     return ''.join(out) + '…' + (RESET if '\x1b' in text else '')
 
 
-def deepseek_input(prompt):
+def deepseek_input(prompt, max_len=64):
     """Small raw-key editor so Esc cancels without waiting for Enter on Windows."""
     if not sys.stdin.isatty():
         try:
@@ -2009,7 +2045,7 @@ def deepseek_input(prompt):
             return value
         if key in ('\b', '\x7f'):
             value = value[:-1]
-        elif len(key) == 1 and key.isprintable() and len(value) < 64:
+        elif len(key) == 1 and key.isprintable() and len(value) < max_len:
             value += key
 
 
@@ -2510,8 +2546,539 @@ def _vram_backup(path: Path) -> str:
     return bak.name
 
 
+# ---------------------------------------------------------------------------
+# your own launch profiles (profiles.py): kept outside the Strata folder, so an update or a setup run never rewrites them.
+# The TUI writes a run config from the profile into its own state folder and starts Strata's serve/server.py with it.
+
+import profiles as _prof            # noqa: E402
+import live_status as _live         # noqa: E402
+import update_check as _upd         # noqa: E402
+
+PROFILES_DIR = _mcfg.profiles_dir()
+STATE_DIR = _mcfg.state_dir()
+COMPONENTS_DIR = _mcfg.components_dir()
+DEFAULT_PROFILES_DIR = TUI_DIR / "profiles-default"
+REFUSAL_WARNING = ("The vector's package describes it as a refusal-direction projection: with it on, the model declines far "
+                   "fewer requests (a safety behaviour is removed) and its answers shift slightly. You are responsible for "
+                   "what it writes. Strata measured 0.2-0.4% more time per token.")
+
+
+def seed_profiles():
+    """The verified profile is always there (copied from the read-only verified file when missing) and read-only; an empty
+    folder also gets the other shipped profiles. An existing file is never replaced."""
+    try:
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        empty = not any(PROFILES_DIR.glob("*.json"))
+        for pid in _prof.PROTECTED_IDS:
+            dst = PROFILES_DIR / f"{pid}.json"
+            if not dst.exists():
+                shutil.copyfile(_set.verified_file(), dst)
+            _prof.set_readonly(dst)
+        if empty:
+            for src in sorted(DEFAULT_PROFILES_DIR.glob("*.json")):
+                dst = PROFILES_DIR / src.name
+                if not dst.exists():
+                    shutil.copyfile(src, dst)
+    except OSError:
+        pass
+
+
+def profile_run_paths(pid: str) -> tuple[Path, Path]:
+    """(the run config the TUI writes, the engine log) of one profile, both in the state folder."""
+    return STATE_DIR / "run" / f"{pid}.json", STATE_DIR / "logs" / f"{pid}.engine.log"
+
+
+def profile_item(path: Path, prof: dict | None, problem: str = "") -> Item:
+    pid = _prof.profile_id(path)
+    run_path, engine_log = profile_run_paths(pid)
+    if prof is None:
+        return Item(kind="profile", title=f"[profile] {pid}", status="BROKEN", path=run_path,
+                    reason=f"{path.name}: {problem}", profile_path=path)
+    try:
+        cfg = _prof.run_config(prof, strata_root=ROOT, components=COMPONENTS_DIR, log_path=engine_log)
+        missing = _prof.missing_files(prof, ROOT)
+    except (_prof.ProfileError, OSError) as e:
+        cfg, missing = None, [str(e)]
+    reason = ("missing " + "; ".join(missing)) if missing else \
+        f"{path}  ·  {prof['drafting']}  ·  refusal vector {_prof.refusal_label(prof)}" + \
+        ("  ·  read-only (verified): E then A saves a copy" if _prof.is_protected(path) else "  ·  Del moves it to _deleted")
+    return Item(kind="profile", title=f"[profile] {prof['name']}", status="BROKEN" if missing or cfg is None else "READY",
+                path=run_path, cfg=cfg, reason=reason, profile_path=path, profile=prof)
+
+
+def profile_items() -> list[Item]:
+    seed_profiles()
+    return [profile_item(p, prof, problem) for p, prof, problem in _prof.list_profiles(PROFILES_DIR)]
+
+
+def write_run_config(item: Item) -> None:
+    item.path.parent.mkdir(parents=True, exist_ok=True)
+    Path(item.cfg["log"]).parent.mkdir(parents=True, exist_ok=True)
+    tmp = item.path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(item.cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(item.path)
+
+
+def update_report_page(report: dict) -> bool:
+    """The engine changed since the last start: how Strata's own files differ from the profile. Enter starts with the
+    profile unchanged, Esc cancels. Nothing is changed anywhere."""
+    width = max(60, shutil.get_terminal_size((120, 40)).columns - 2)
+    lines = [BOLD + YELLOW + f"Engine changed: {report['previous']} -> {report['version']}" + RESET, "",
+             "Your profile is used as it is. Strata's own launch files now differ from it as follows",
+             DIM + "(for review only: nothing was changed; Strata puts its drafter flags on at start, per its \"drafting\")" + RESET, ""]
+    if not report["sources"]:
+        lines.append("  No Strata file for this model was found.")
+    for label, diffs in report["sources"]:
+        lines.append(BOLD + "  " + label + RESET)
+        lines += [("    " + d) for d in diffs] or [DIM + "    same as the profile" + RESET]
+        lines.append("")
+    lines += ["", "Enter Start with the profile   Esc Cancel"]
+    request_clear()
+    paint("\n".join(cell_clip(x, width) for x in lines) + "\n")
+    while True:
+        key = (read_key() or "").lower()
+        if key == "enter":
+            return True
+        if key in ("esc", "b", "q"):
+            return False
+
+
+def start_profile(item: Item) -> None:
+    prof = item.profile
+    report = _upd.check(prof, strata_root=ROOT, components=COMPONENTS_DIR, state=STATE_DIR, record=False)
+    if report["changed"] and not update_report_page(report):
+        return
+    if report["version"]:
+        _upd.mark_seen(STATE_DIR, report["version"])
+    port = prof["port"]
+    live = health(port)
+    if live:
+        actual = live.get("model") or "unknown"
+        log_page("ERROR" if actual != prof["model_name"] else "RUNNING",
+                 f":{port} is already serving {actual}; stop it first to start this profile", port)
+        return
+    try:
+        item.cfg = _prof.run_config(prof, strata_root=ROOT, components=COMPONENTS_DIR, log_path=Path(item.cfg["log"]))
+        write_run_config(item)
+    except (OSError, _prof.ProfileError) as e:
+        log_page("ERROR", f"run config not written: {e}", port)
+        return
+    append_log(f"Profile {item.profile_path} -> {item.path} (engine options: {' '.join(_prof.engine_argv(prof, ROOT))})")
+    runner = LoadRunner(item)
+    log_page("LOADING", prof["model_name"], port,
+             extra=f"profile {_prof.profile_id(item.profile_path)} · refusal vector {_prof.refusal_label(prof)}",
+             sources=[LOG_FILE, Path(item.cfg["log"])], active=runner.alive, finished=runner.finish,
+             banner=f"==== MODEL READY · http://127.0.0.1:{port} ====")
+
+
+def _wrap_argv(argv: list[str], width: int) -> list[str]:
+    out, cur = [], ""
+    for g in _prof.groups(argv):
+        part = " ".join(g)
+        if cur and len(cur) + 1 + len(part) > width:
+            out.append(cur)
+            cur = part
+        else:
+            cur = f"{cur} {part}".strip()
+    return out + ([cur] if cur else [])
+
+
+def profile_page(item: Item) -> None:
+    """One profile: what it starts, the refusal vector, start / edit / save as."""
+    notice = ""
+    while True:
+        try:
+            prof = _prof.load(item.profile_path)
+        except (OSError, ValueError) as e:
+            log_page("ERROR", f"{item.profile_path.name}: {e}", None, sources=[])
+            return
+        item = profile_item(item.profile_path, prof)
+        width = max(60, min(160, shutil.get_terminal_size((120, 40)).columns - 2))
+        r = prof["refusal"]
+        lines = [BOLD + "PROFILE  " + prof["name"] + RESET, DIM + str(item.profile_path) + RESET]
+        if notice:
+            lines.append(CYAN + notice + RESET)
+        lines += ["", f"Model     {prof['model_name']}   port {prof['port']}   drafting {prof['drafting']}   "
+                      f"vision {(prof.get('vision') or {}).get('mode', 'off')}",
+                  f"Env       {' '.join(f'{k}={v}' for k, v in (prof.get('env') or {}).items()) or '-'}", "Options"]
+        lines += ["  " + x for x in _wrap_argv(prof["args"], width - 4)]
+        state = (GREEN + "ON" + RESET) if r["enabled"] else (DIM + "off" + RESET)
+        vec = _prof.vector_path(r, ROOT)
+        lines += ["", BOLD + "Refusal vector  " + RESET + state +
+                  f"   strength x{float(r['scale']):g}   layers {r['layers'][0]}-{r['layers'][1]}   mode {r['mode']}  dir {r['dir']}",
+                  f"  vector {'builtin: ' if r['vector'] == 'builtin' else ''}{vec}" + ("" if vec.is_file() else RED + "  (not found)" + RESET),
+                  f"  per request: {'on unless a request sends experimental_speed_projection=false' if r['per_request_default'] else 'off unless a request sends experimental_speed_projection=true'}"]
+        if r["enabled"]:
+            lines.append(YELLOW + "  " + REFUSAL_WARNING + RESET)
+        if item.status != "READY":
+            lines += ["", RED + item.reason + RESET]
+        lines += ["", "Enter Start   E Settings (all options)   T Refusal on/off   P Per-request default   A Save as   Esc Back",
+                  DIM + "Changes are saved to the profile (the old file is kept as .json.bak) and apply at the next start." + RESET]
+        request_clear()
+        paint("\n".join(cell_clip(x, width) for x in lines) + "\n")
+        key = (read_key() or "").lower()
+        notice = ""
+        new = json.loads(json.dumps(prof))
+        nr = new["refusal"]
+        if key in ("esc", "b", "q"):
+            return
+        if key == "enter":
+            if item.status == "READY":
+                start_profile(item)
+                return
+            notice = "not startable: " + item.reason
+            continue
+        if key in ("t", "p") and _prof.is_protected(item.profile_path):
+            notice = "the verified profile is read-only: E opens its settings, A there saves your changes as a new profile"
+            continue
+        if key == "t":
+            if not nr["enabled"] and not deepseek_confirm("Turn the refusal vector on?", REFUSAL_WARNING):
+                continue
+            nr["enabled"] = not nr["enabled"]
+        elif key == "e":
+            item = settings_page(item.profile_path) or item
+            continue
+        elif key == "p":
+            nr["per_request_default"] = not nr["per_request_default"]
+        elif key == "a":
+            sys.stdout.write("\n")
+            v = deepseek_input("New profile file name (letters, digits, . _ -; Esc cancels): ")
+            if v is None:
+                continue
+            title = deepseek_input("Shown name (Enter keeps a copy of this one): ", max_len=120)
+            copy = json.loads(json.dumps(prof))
+            copy["name"] = title.strip() if title and title.strip() else prof["name"] + " (copy)"
+            try:
+                path = _prof.save_as(PROFILES_DIR, v.strip(), copy)
+            except (_prof.ProfileError, OSError) as e:
+                notice = str(e)
+                continue
+            item = profile_item(path, copy)
+            notice = f"saved as {path.name}; now editing it"
+            continue
+        else:
+            continue
+        try:
+            _prof.save(item.profile_path, new)
+            notice = "saved"
+        except (_prof.ProfileError, OSError) as e:
+            notice = f"not saved: {e}"
+
+
+# ---------------------------------------------------------------------------
+# settings menu (settings_spec.py): every option of a profile, its verified default, what it does and costs
+
+import settings_spec as _set        # noqa: E402
+
+
+def profile_running(path: Path) -> int | None:
+    """The port when the model on it was started by this TUI from this profile file, else None."""
+    rt = runtime_load() or {}
+    try:
+        same = rt.get("profile") and Path(rt["profile"]).resolve() == Path(path).resolve()
+    except OSError:
+        same = False
+    port = int(rt.get("port") or 0)
+    return port if same and port and health(port) else None
+
+
+def launch_command_lines(prof: dict, run_path: Path, width: int) -> list[str]:
+    """What a start runs: the server (with its environment) and the engine command the server builds from the profile."""
+    folder = _prof.active_engine_folder(COMPONENTS_DIR)
+    exe = (folder / ("strata.exe" if os.name == "nt" else "strata")) if folder else Path("<engine not found>")
+    env = {"STRATA_NO_PRESET": "1", **(prof.get("env") or {})}
+    lines = [BOLD + "Environment" + RESET] + [f"  {k}={v}" for k, v in env.items()]
+    lines += [BOLD + "Server" + RESET,
+              f"  {normal_python()} {ROOT / 'serve' / 'server.py'} --engine strata --config {run_path} --port {prof['port']}",
+              BOLD + "Engine (started by the server)" + RESET, f"  {exe} --serve"]
+    lines += ["    " + x for x in _wrap_argv(_prof.engine_argv(prof, ROOT), width - 6)]
+    if (prof.get("vision") or {}).get("mode", "off") != "off":
+        v = prof["vision"]
+        lines.append(f"  picture reader: {v['mode']}, up to {v.get('max_tokens', 300)} tokens a picture, mmproj {v['mmproj']}")
+    if prof.get("drafting") == "dflash2":
+        lines.append(DIM + "  (Strata picks the DFlash2 pack and writes --draft-fallback none itself; the live line checks the real "
+                           "command after the start)" + RESET)
+    return lines
+
+
+def confirm_page(title: str, body: list[str], yes: str = "Enter Confirm", no: str = "Esc Cancel") -> bool:
+    width = max(60, shutil.get_terminal_size((120, 40)).columns - 2)
+    request_clear()
+    paint("\n".join(cell_clip(x, width) for x in [BOLD + title + RESET, ""] + body + ["", f"{yes}   {no}"]) + "\n")
+    while True:
+        key = (read_key() or "").lower()
+        if key in ("enter", "y"):
+            return True
+        if key in ("esc", "b", "n", "q"):
+            return False
+
+
+def delete_profile(item: Item | None) -> str:
+    """Del on a profile row: after a confirmation, the file moves to <profiles>/_deleted/ (found again there). Returns the notice."""
+    if item is None or item.kind != "profile" or item.profile_path is None:
+        return "Del deletes a profile: select a [profile] row first"
+    path = item.profile_path
+    if _prof.is_protected(path):
+        return f"{path.name} holds the verified settings and cannot be deleted"
+    rt = runtime_load() or {}
+    try:
+        mine = bool(rt.get("profile")) and Path(rt["profile"]).resolve() == path.resolve()
+    except OSError:
+        mine = False
+    if mine and health(int(rt.get("port") or 0)):
+        return f"{path.name} is running on :{rt.get('port')}: stop it first (X), then delete it"
+    if not confirm_page("Delete this profile?",
+                        [f"File: {path}", f"It moves to: {path.parent / _prof.TRASH}\\ (with a time stamp; move it back to restore it)",
+                         f"Name: {(item.profile or {}).get('name', path.stem)}"],
+                        yes="Enter Delete", no="Esc Keep"):
+        return "nothing deleted"
+    try:
+        dest = _prof.soft_delete(path)
+    except (_prof.ProfileError, OSError) as e:
+        return f"not deleted: {e}"
+    append_log(f"Profile {path} moved to {dest}")
+    return f"moved to {dest}"
+
+
+def restart_profile(path: Path) -> None:
+    """Stops the model this TUI started, then starts the profile again."""
+    rt = runtime_load() or {}
+    port = int(rt.get("port") or 0)
+    request_clear()
+    paint(BOLD + f"Stopping {rt.get('model_name') or 'Strata'} on :{port} ..." + RESET + "\n")
+    stop_owned()
+    for _ in range(40):
+        if not health(port):
+            break
+        time.sleep(0.25)
+    if health(port):
+        log_page("ERROR", f"still running on :{port}; not restarted - see the log", port)
+        return
+    try:
+        prof = _prof.load(path)
+    except (OSError, ValueError) as e:
+        log_page("ERROR", f"{path.name}: {e}", None, sources=[])
+        return
+    item = profile_item(path, prof)
+    if item.status != "READY":
+        log_page("ERROR", item.reason, None, sources=[])
+        return
+    start_profile(item)
+
+
+def _settings_input(it, cur: str) -> str | None:
+    """Asks for a value: a letter picks a preset, free text is a value (when the item takes one)."""
+    letters = "abcdefgh"
+    presets = "   ".join(f"[{letters[i]}] {c}" for i, c in enumerate(it.choices))
+    allowed = ("type a value: " + it.hint) if it.free else ""
+    sys.stdout.write("\n")
+    v = deepseek_input(f"{it.label} (now {cur})  {presets}  {allowed}  Esc cancels: ", max_len=400)
+    if v is None:
+        return None
+    v = v.strip()
+    if len(v) == 1 and v.lower() in letters[:len(it.choices)]:
+        return it.choices[letters.index(v.lower())]
+    if not it.free and v not in it.choices:
+        raise _set.Invalid(f"{it.label}: choose one of {', '.join(it.choices)}")
+    return v
+
+
+def settings_page(path: Path):
+    """All of a profile's options. Edits stay in memory until S saves them (after the full launch command is shown)."""
+    try:
+        saved = _prof.load(path)
+    except (OSError, ValueError) as e:
+        log_page("ERROR", f"{Path(path).name}: {e}", None, sources=[])
+        return None
+    verified = _set.verified()
+    prof = json.loads(json.dumps(saved))
+    pos, notice, error = 0, "", ""
+    while True:
+        width = max(70, min(170, shutil.get_terminal_size((120, 40)).columns - 2))
+        items = _set.visible(prof)
+        pos = max(0, min(pos, len(items) - 1))
+        dirty = not _set.same(prof, saved)
+        lines = [BOLD + "SETTINGS  " + prof["name"] + RESET + (YELLOW + "   * unsaved changes" + RESET if dirty else ""),
+                 DIM + f"{path}   ·   verified defaults (read-only): {_set.verified_file()}" + RESET, ""]
+        group = None
+        for i, it in enumerate(items):
+            if it.group != group:
+                group = it.group
+                lines.append(CYAN + group + RESET)
+            cur, dflt = it.get(prof), it.get(verified)
+            diff = cur != dflt
+            mark = ">" if i == pos else " "
+            short = lambda s, n: s if len(s) <= n else "…" + s[-(n - 1):]      # paths: keep the file name end
+            val = (YELLOW + BOLD if diff else "") + f"{short(cur, 30):30}" + RESET
+            tag = (DIM + "locked " + RESET) if it.locked else (YELLOW + "changed" + RESET if diff else "       ")
+            lines.append(f"{BOLD if i == pos else ''}{mark} {it.label[:30]:30}{RESET} {tag} {val} {DIM}default {short(dflt, 24)}{RESET}")
+        it = items[pos]
+        lines += ["", BOLD + it.label + RESET + "  " + it.desc]
+        if it.locked:
+            lines.append(DIM + "  locked: " + it.locked + RESET)
+        else:
+            opts = ", ".join(it.choices)
+            lines.append(DIM + "  values: " + (opts + (" or " if it.free and opts else "") if opts else "") +
+                         (it.hint if it.free else "") + RESET)
+        if error:
+            lines.append(RED + "  " + error + RESET)
+        if notice:
+            lines.append(CYAN + "  " + notice + RESET)
+        lines += ["", "↑/↓ Select   Enter Change   D Restore this one   R Restore all   S Save   A Save as new profile   Esc Back"]
+        request_clear()
+        paint("\n".join(cell_clip(x, width) for x in lines) + "\n")
+        key = (read_key() or "").lower()
+        notice, error = "", ""
+        if key == "up":
+            pos = (pos - 1) % len(items)
+        elif key == "down":
+            pos = (pos + 1) % len(items)
+        elif key == "enter":
+            if it.locked:
+                error = "locked: " + it.locked
+                continue
+            try:
+                text = _settings_input(it, it.get(prof))
+                if text is None:
+                    continue
+                new = _set.apply(it, prof, text)
+                if it.key == "refusal" and new["refusal"]["enabled"] and not prof["refusal"]["enabled"]:
+                    if not deepseek_confirm("Turn the refusal vector on?", REFUSAL_WARNING):
+                        continue
+                prof = new
+                notice = f"{it.label} = {it.get(prof)} (not saved yet)"
+            except _set.Invalid as e:
+                error = f"refused: {e}"
+        elif key == "d":
+            if it.locked:
+                error = "locked: " + it.locked
+                continue
+            try:
+                prof = _set.restore(it, prof, verified)
+                notice = f"{it.label} back to the verified {it.get(prof)} (not saved yet)"
+            except _set.Invalid as e:
+                error = f"refused: {e}"
+        elif key == "r":
+            if confirm_page("Restore every option to the verified defaults?",
+                            ["Changed now: " + (", ".join(_set.changed_items(prof, verified)) or "nothing")]):
+                prof = _set.restore_all(prof, verified)
+                notice = "all options back to the verified defaults (not saved yet)"
+        elif key in ("s", "a"):
+            try:
+                _prof.validate(prof)
+            except _prof.ProfileError as e:
+                error = f"cannot save: {e}"
+                continue
+            target, new_name = path, None
+            if key == "s" and _prof.is_protected(path):
+                error = "the verified profile is read-only: A saves these settings as a new profile"
+                continue
+            if key == "a":
+                sys.stdout.write("\n")
+                fid = deepseek_input("New profile file name (letters, digits, . _ -; e.g. long-chat; Esc cancels): ")
+                if fid is None:
+                    continue
+                title = deepseek_input("Shown name (e.g. 长对话; Enter = file name): ", max_len=120)
+                new_name = (title or "").strip() or fid.strip()
+                target = PROFILES_DIR / f"{fid.strip()}.json"
+            out = json.loads(json.dumps(prof))
+            if new_name:
+                out["name"] = new_name
+            run_path = profile_run_paths(_prof.profile_id(target))[0]
+            body = [f"Profile file: {target}", "Changed from the verified defaults: " +
+                    (", ".join(_set.changed_items(out, verified)) or "none"), ""] + launch_command_lines(out, run_path, width)
+            if not confirm_page("Save these settings? A start will run:", body, yes="Enter Save"):
+                continue
+            try:
+                if key == "a":
+                    target = _prof.save_as(PROFILES_DIR, _prof.profile_id(target), out)
+                else:
+                    _prof.save(target, out)
+            except (_prof.ProfileError, OSError) as e:
+                error = f"not saved: {e}"
+                continue
+            path, saved, prof = target, out, json.loads(json.dumps(out))
+            notice = f"saved to {target.name} (the old file is kept as .json.bak)"
+            port = profile_running(target)
+            if port is not None:
+                if confirm_page("Restart the engine now?",
+                                [f"{prof['model_name']} is running on :{port} from this profile with the old settings.",
+                                 "The new settings apply only after a restart (the conversation cache is lost)."],
+                                yes="Enter Restart now", no="Esc Later"):
+                    restart_profile(target)
+                    return profile_item(target, _prof.load(target))
+                notice += "; the running engine keeps the old settings until it is restarted"
+            elif health(prof["port"]):
+                notice += f"; :{prof['port']} is serving a model this TUI did not start from this profile - stop it before starting this one"
+        elif key in ("esc", "b", "q"):
+            if dirty and not confirm_page("Leave without saving?", ["Changed (not saved): " +
+                                          ", ".join(i.label for i in _set.ITEMS if i.get(prof) != i.get(saved))],
+                                          yes="Enter Discard changes", no="Esc Keep editing"):
+                continue
+            try:
+                return profile_item(path, _prof.load(path))
+            except (OSError, ValueError):
+                return None
+
+
+class LiveStatus:
+    """The main menu's live line: polled in the background every `interval` seconds, so a slow answer never holds a key."""
+
+    def __init__(self, interval: float = 2.0):
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.value: tuple | None = None          # (port, health, status line, arg differences) or None when nothing runs
+        self._logs: dict[tuple, str | None] = {}   # (port, model) -> engine log of a server started elsewhere (looked up once)
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _probe(self):
+        rt = runtime_load() or {}
+        ports = sorted({int(rt.get("port") or 8080), 8080})
+        for port in ports:
+            h = health(port)
+            if not h:
+                continue
+            prof = None
+            if rt.get("profile") and int(rt.get("port") or 0) == port:
+                try:
+                    prof = _prof.load(Path(rt["profile"]))
+                except (OSError, ValueError):
+                    prof = None
+            engine_log = rt.get("engine_log") if int(rt.get("port") or 0) == port else None
+            if not engine_log:                   # started elsewhere (Strata's Terminal or app): find its run config's log
+                key = (port, h.get("model"))
+                if key not in self._logs:
+                    local = os.environ.get("LOCALAPPDATA")
+                    folders = [STATE_DIR / "run", ROOT] + ([Path(local) / "Strata" / "launch"] if local else [])
+                    self._logs[key] = _live.engine_log_of_server(port, folders)
+                engine_log = self._logs[key]
+            snap = _live.snapshot(port, engine_log, prof, ROOT if prof else None)
+            return port, h, _live.status_line(snap), snap.get("diffs") or []
+        return None
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                value = self._probe()
+            except Exception:                    # noqa: BLE001 - the menu keeps working without a status line
+                value = None
+            with self.lock:
+                self.value = value
+            self._stop.wait(self.interval)
+
+    def get(self):
+        with self.lock:
+            return self.value
+
+
+LIVE: LiveStatus | None = None
+
+
 def main():
+    global LIVE
     enable_ansi()
+    LIVE = LiveStatus()
     model_root = default_model_root()
     show_unsupported = False
     items, unsupported_count = all_items(model_root, show_unsupported)
@@ -2521,8 +3088,12 @@ def main():
     while True:
         pos = max(0, min(pos, max(0, len(items) - 1)))
         render_menu(items, pos, model_root, unsupported_count, show_unsupported, notice)
+        key = (read_key(1.0) or "").lower()       # the running model's live line refreshes once a second
+        if not key:
+            continue                              # nothing pressed: repaint only if the live line changed
         notice = ""
-        key = (read_key() or "").lower()          # blocking: the menu never redraws on its own
+        if key not in ("up", "down"):
+            request_clear()                       # another page may be on screen when we come back
 
         if key == "up" and items:
             pos = (pos - 1) % len(items)
@@ -2531,7 +3102,10 @@ def main():
         elif key == "enter" and items:
             item = items[pos]
             request_clear()
-            if item.kind == "config" and item.status == "READY":
+            if item.kind == "profile" and item.profile is not None:
+                profile_page(item)
+                request_clear()
+            elif item.kind == "config" and item.status == "READY":
                 start_via_options(item)
             elif item.status == "PREPARE":
                 process = prepare(item)
@@ -2563,6 +3137,17 @@ def main():
         elif key == "r":
             items, unsupported_count = all_items(model_root, show_unsupported)
             pos = 0
+        elif key == "e":
+            cur = items[pos] if items else None
+            if cur is not None and cur.kind == "profile" and cur.profile is not None:
+                settings_page(cur.profile_path)
+                items, unsupported_count = all_items(model_root, show_unsupported)
+            else:
+                notice = "E opens the settings of a profile: select a [profile] row first"
+        elif key == "del":
+            cur = items[pos] if items else None
+            notice = delete_profile(cur)
+            items, unsupported_count = all_items(model_root, show_unsupported)
         elif key == "x":
             request_clear()
             rt = runtime_load() or {}

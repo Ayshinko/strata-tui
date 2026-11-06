@@ -35,3 +35,6 @@ Thumbs.db
 .secrets
 models/
 mtp/
+
+# STRATA-TUI profiles: your real ones live outside the repo (STRATA_TUI_PROFILES); only the shipped defaults are tracked
+profiles-default/*.json.bak
