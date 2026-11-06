@@ -525,3 +525,19 @@ def changed_items(prof: dict, v: dict | None = None) -> list[str]:
 
 def same(a: dict, b: dict) -> bool:
     return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+#: Plain names shown beside each option in the settings menu (the option's own name stays in the second column).
+TITLES = {
+    "max_context": "Context length", "kv": "KV precision", "kv_resident": "KV kept in VRAM", "kv_grow": "KV grows on demand",
+    "prefill": "Prompt chunk size", "vision": "Images", "vision_device": "Image reader on", "vision_tokens": "Tokens per image",
+    "drafting": "Drafter", "draft_model": "DFlash2 pack", "mtp_draft_vocab": "Draft vocabulary", "spec": "Draft window",
+    "draft_conf": "DFlash2 confidence", "draft_fallback": "Fallback drafter", "spec_min_p": "MTP confidence",
+    "vram_reserve": "VRAM reserve", "expert_cache": "Experts in VRAM", "route_prior": "Prefer cached experts",
+    "refusal": "Refusal vector", "refusal_vector": "Vector file", "refusal_scale": "Strength", "refusal_layers": "Layers",
+    "port": "API port",
+}
+
+
+def title(item: Item) -> str:
+    return TITLES.get(item.key, item.label)

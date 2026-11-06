@@ -2935,33 +2935,50 @@ def settings_page(path: Path):
         items = _set.visible(prof)
         pos = max(0, min(pos, len(items) - 1))
         dirty = not _set.same(prof, saved)
-        lines = [BOLD + "SETTINGS  " + prof["name"] + RESET + (YELLOW + "   * unsaved changes" + RESET if dirty else ""),
-                 DIM + f"{path}   ·   verified defaults (read-only): {_set.verified_file()}" + RESET, ""]
-        group = None
+        head = [BOLD + "SETTINGS  " + prof["name"] + RESET + (YELLOW + "   * unsaved changes" + RESET if dirty else ""),
+                DIM + f"{path}   ·   verified defaults (read-only): {_set.verified_file()}" + RESET, ""]
+        # every row of the list (group headings too); `sel` is the row of the selected option
+        rows, sel, group = [], 0, None
+        short = lambda s, n: s if len(s) <= n else "…" + s[-(n - 1):]      # paths: keep the file name end
         for i, it in enumerate(items):
             if it.group != group:
                 group = it.group
-                lines.append(CYAN + group + RESET)
+                rows.append(CYAN + group + RESET)
             cur, dflt = it.get(prof), it.get(verified)
             diff = cur != dflt
             mark = ">" if i == pos else " "
-            short = lambda s, n: s if len(s) <= n else "…" + s[-(n - 1):]      # paths: keep the file name end
-            val = (YELLOW + BOLD if diff else "") + f"{short(cur, 30):30}" + RESET
+            val = (YELLOW + BOLD if diff else "") + f"{short(cur, 28):28}" + RESET
             tag = (DIM + "locked " + RESET) if it.locked else (YELLOW + "changed" + RESET if diff else "       ")
-            lines.append(f"{BOLD if i == pos else ''}{mark} {it.label[:30]:30}{RESET} {tag} {val} {DIM}default {short(dflt, 24)}{RESET}")
+            if i == pos:
+                sel = len(rows)
+            rows.append(f"{BOLD if i == pos else ''}{mark} {_set.title(it)[:22]:22} {DIM}{it.label[:26]:26}{RESET} {tag} {val} "
+                        f"{DIM}default {short(dflt, 22)}{RESET}")
         it = items[pos]
-        lines += ["", BOLD + it.label + RESET + "  " + it.desc]
+        foot = ["", BOLD + _set.title(it) + RESET + f" ({it.label})  " + it.desc]
         if it.locked:
-            lines.append(DIM + "  locked: " + it.locked + RESET)
+            foot.append(DIM + "  locked: " + it.locked + RESET)
         else:
             opts = ", ".join(it.choices)
-            lines.append(DIM + "  values: " + (opts + (" or " if it.free and opts else "") if opts else "") +
-                         (it.hint if it.free else "") + RESET)
+            foot.append(DIM + "  values: " + (opts + (" or " if it.free and opts else "") if opts else "") +
+                        (it.hint if it.free else "") + RESET)
         if error:
-            lines.append(RED + "  " + error + RESET)
+            foot.append(RED + "  " + error + RESET)
         if notice:
-            lines.append(CYAN + "  " + notice + RESET)
-        lines += ["", "↑/↓ Select   Enter Change   D Restore this one   R Restore all   S Save   A Save as new profile   Esc Back"]
+            foot.append(CYAN + "  " + notice + RESET)
+        foot += ["", "↑/↓ Select   Enter Change   D Restore this one   R Restore all   S Save   A Save as new profile   Esc Back"]
+        # the list scrolls inside what the terminal can show, so the top rows are never pushed off screen
+        height = shutil.get_terminal_size((120, 40)).lines
+        room = max(5, height - len(head) - len(foot) - 3)       # 2 for the "more" markers, 1 so the last line does not scroll
+        if len(rows) <= room:
+            shown, above, below = rows, 0, 0
+        else:
+            top = min(max(0, sel - room // 2), len(rows) - room)
+            if top > 0 and rows[top - 1].startswith(CYAN) and sel < top - 1 + room:   # keep a group heading with its first option
+                top -= 1
+            shown, above, below = rows[top:top + room], top, len(rows) - (top + room)
+        body = ([DIM + f"  ↑ {above} more" + RESET] if above else [""]) + shown + \
+               ([DIM + f"  ↓ {below} more" + RESET] if below else [""])
+        lines = head + body + foot
         request_clear()
         paint("\n".join(cell_clip(x, width) for x in lines) + "\n")
         key = (read_key() or "").lower()
