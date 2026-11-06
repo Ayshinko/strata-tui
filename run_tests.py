@@ -29,7 +29,7 @@ def main() -> int:
                    TEMP=temporary, TMP=temporary, TMPDIR=temporary, PYTHONIOENCODING='utf-8',
                    STRATA_TUI_PROFILES=str(Path(temporary) / 'profiles'), STRATA_TUI_STATE=str(Path(temporary) / 'state'))
         commands: list[tuple[str, ...]] = [('-m', 'unittest', name, '-v') for name in
-                    ('test_vram', 'test_merged_load', 'test_official_families', 'test_deepseek_settings', 'test_deepseek_bench', 'test_profiles', 'test_settings')]
+                    ('test_vram', 'test_merged_load', 'test_official_families', 'test_deepseek_settings', 'test_deepseek_bench', 'test_profiles', 'test_settings', 'test_setup_env')]
         commands.append(('test_ui_repaint.py',))
         for command in commands:
             result = subprocess.run([sys.executable, *command], cwd=here, env=env,

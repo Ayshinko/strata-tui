@@ -1146,14 +1146,47 @@ def prepare_command(item: Item) -> list[str]:
     ]
 
 
+def setup_install_dir() -> Path:
+    """Where Strata's own launcher points setup (STRATA_INSTALL_DIR): its catalog's install root (strata_cli/launch/catalog.py
+    install_root), which for a source checkout is the checkout itself. ROOT when that cannot be read."""
+    try:
+        from strata_cli.launch.catalog import install_root
+        return Path(install_root(None, ROOT))
+    except Exception:  # noqa: BLE001 - an older checkout without the launcher: setup's own home is ROOT
+        return ROOT
+
+
+def setup_env(cmd: list) -> dict | None:
+    """The environment of a setup.py run, the way Strata's launcher runs it (strata_cli/launch/runner.py): installer mode
+    STRATA_CONTROL_INSTALL=1, so setup only prepares the model - no Python packages, no engine download or build; the run
+    config names "component:strata-engine" (the components folder's engine). None (inherit) for any command that is not
+    this checkout's setup.py."""
+    try:
+        is_setup = len(cmd) > 1 and Path(cmd[1]).resolve() == (ROOT / "setup.py").resolve()
+    except OSError:
+        is_setup = False
+    if not is_setup:
+        return None
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", PYTHONNOUSERSITE="1",
+               STRATA_CONTROL_INSTALL="1", STRATA_INSTALL_DIR=str(setup_install_dir()),
+               STRATA_COMPONENTS_DIR=str(COMPONENTS_DIR))
+    env.pop("STRATA_NO_ACQUIRE", None)      # preparing is the explicit step that may download model files
+    env.pop("STRATA_NEED_ENGINE", None)     # (as the launcher: a model can be prepared before its engine is installed)
+    return env
+
+
 def _spawn_setup(cmd: list, header: str) -> subprocess.Popen | None:
-    """Run the current setup.py with output appended to the shared log."""
+    """Run the current setup.py with output appended to the shared log (in Strata's installer mode, see setup_env)."""
+    env = setup_env(cmd)
     log = open(LOG_FILE, "a", encoding="utf-8", errors="replace")
     log.write(f"\n\n--- {header} {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-    log.write(" ".join(f'"{x}"' if " " in x else x for x in cmd) + "\n\n")
+    log.write(" ".join(f'"{x}"' if " " in x else x for x in cmd) + "\n")
+    if env is not None:
+        log.write(f"(installer mode: STRATA_CONTROL_INSTALL=1, STRATA_INSTALL_DIR={env['STRATA_INSTALL_DIR']})\n")
+    log.write("\n")
     log.flush()
     try:
-        process = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT, env=env)
     except Exception as e:
         log.write(f"{header} failed to start: {e}\n")
         log.close()
