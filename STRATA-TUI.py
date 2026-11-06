@@ -657,6 +657,10 @@ def validate_gguf_headers(folder: Path, family: str, filename_model: str | None)
                                f"Shards contain {total_tensors} tensors; metadata declares {total_declared}")
 
     for p, g in zip(shards, parsed):
+        if not g.tensors:
+            # a metadata-only shard (Unsloth v3.1's first shard: 0 tensors) ends with its header; the aligned data start
+            # past it is not file content, so there is nothing to check beyond the header that was just read
+            continue
         try:
             need = g.data_start + max(
                 (t.offset + (t.expected_bytes() or 0) for t in g.tensors),
