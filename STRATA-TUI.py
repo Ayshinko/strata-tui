@@ -2643,9 +2643,21 @@ def profile_item(path: Path, prof: dict | None, problem: str = "") -> Item:
                 path=run_path, cfg=cfg, reason=reason, profile_path=path, profile=prof)
 
 
+def _protected_model_missing(path: Path, prof: dict | None) -> bool:
+    """A protected (verified) profile whose model files are gone: it cannot be deleted, so the menu hides it
+    instead. The file itself is left untouched and the row comes back once the model files are restored."""
+    if prof is None or not _prof.is_protected(path):
+        return False
+    try:
+        return bool(_prof.missing_files(prof, ROOT))
+    except (_prof.ProfileError, OSError):
+        return False
+
+
 def profile_items() -> list[Item]:
     seed_profiles()
-    return [profile_item(p, prof, problem) for p, prof, problem in _prof.list_profiles(PROFILES_DIR)]
+    return [profile_item(p, prof, problem) for p, prof, problem in _prof.list_profiles(PROFILES_DIR)
+            if not _protected_model_missing(p, prof)]
 
 
 def write_run_config(item: Item) -> None:
