@@ -251,6 +251,12 @@ gives no limit, the owner's range is used (`settings_spec.py` says which). `--dr
 but locked: with dflash2, Strata's server picks the pack and writes `--draft-fallback none` itself. Switching the drafter
 to mtp uses Strata setup's MTP values (`--mtp <mtp folder> --spec 4 --spec-min-p 0.5`), which were not verified on this PC.
 
+The drafter can also be `auto`: Strata then picks the drafter, its window and confidence per model and card class (0.1.58 on a
+12 GB card: IQ3_S starts the MTP, UD-IQ4_XS-v31 DFlash2 with its tuned pack, other sets DFlash2); the profile leaves those options out of
+`user_args` and the live line does not count them as differences. `STRATA_DF2_GATE` (Adaptive DFlash2 window, opt-in, new in 0.1.58)
+replaces the fixed `--draft-conf` with each request's measured hit rate. The tuned drafter pack row only shows whether Strata would use
+its tuned pack for this model and whether the file is downloaded (`strata drafting fetch`).
+
 ### Engine updates
 
 Before each start the TUI compares the active engine package with the one it saw last time

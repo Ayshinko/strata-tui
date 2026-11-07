@@ -304,6 +304,19 @@ def engine_version(components: Path) -> str | None:
     return folder.name.split("-", 1)[0] if folder else None
 
 
+#: The options of the drafter choice (strata_control/drafting.py DRAFT_FLAGS and MTP_ONLY_FLAGS, plus the window --spec).
+DRAFTER_OWNED = ("--draft", "--draft-model", "--draft-fallback", "--draft-conf", "--draft-cap", "--draft-rule", "--draft-mtp-spec",
+                 "--draft-mtp-min-p", "--mtp", "--mtp-q4", "--mtp-hnorm", "--mtp-window", "--mtp-draft-vocab", "--spec-min-p", "--spec")
+
+
+def kept_by_profile(profile: dict, argv: list[str]) -> list[str]:
+    """The options that are the profile's own word at every start (Strata's user_args): all of them, except that with
+    "drafting": "auto" the drafter's options are Strata's to choose (drafter, window, confidence, pack) and are left out."""
+    if profile.get("drafting") == "auto":
+        return without(argv, DRAFTER_OWNED)
+    return list(argv)
+
+
 def run_config(profile: dict, *, strata_root: Path, components: Path, log_path: Path) -> dict:
     """Strata's run config for this profile (written by the TUI to its own state folder)."""
     validate(profile)
@@ -311,7 +324,7 @@ def run_config(profile: dict, *, strata_root: Path, components: Path, log_path: 
     cfg: dict[str, Any] = {
         "exe": profile.get("engine") or "component:strata-engine",
         "args": list(argv),
-        "user_args": list(argv),
+        "user_args": kept_by_profile(profile, argv),
         "drafting": profile["drafting"],
         "cwd": str(strata_root),
         "tokenizer": profile["model"]["tokenizer"],

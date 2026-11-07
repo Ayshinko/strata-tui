@@ -171,7 +171,10 @@ def snapshot(port: int, engine_log: Path | str | None, profile: dict | None = No
     compared = bool(profile is not None and strata_root is not None and start.get("argv"))
     if compared:
         try:
-            diffs = compare_args(P.engine_argv(profile, strata_root), start["argv"])
+            want, got = P.engine_argv(profile, strata_root), start["argv"]
+            if profile.get("drafting") == "auto":       # the drafter's options are Strata's choice there, not a difference
+                want, got = P.without(want, P.DRAFTER_OWNED), P.without(got, P.DRAFTER_OWNED)
+            diffs = compare_args(want, got)
         except Exception as e:  # noqa: BLE001
             diffs = [f"compare failed: {e}"]
     return {"start": start, "metrics": view, "diffs": diffs, "compared": compared}

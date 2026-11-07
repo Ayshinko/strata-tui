@@ -233,10 +233,16 @@ def drafting_of(p: dict) -> str:
 
 
 def set_drafting(p: dict, mode: str, v: dict | None = None) -> None:
-    """dflash2 / mtp / off, with the drafter's options of that choice. A switch stashes the options it removes in the profile
-    ("drafter_options"), so switching back brings the person's own values back; else the verified ones (dflash2) or setup's (mtp)."""
+    """dflash2 / mtp / off / auto, with the drafter's options of that choice. A switch stashes the options it removes in the profile
+    ("drafter_options"), so switching back brings the person's own values back; else the verified ones (dflash2) or setup's (mtp).
+    auto: the MTP folder and setup's MTP options, as setup writes them; Strata then picks the drafter, its window and confidence
+    (profiles.run_config leaves these out of user_args for auto, so Strata's choice is not overridden)."""
+    if mode == "auto":
+        set_drafting(p, "mtp", v)
+        p["drafting"] = "auto"
+        return
     if mode not in ("dflash2", "mtp", "off"):
-        raise Invalid("the drafter is dflash2, mtp or off")
+        raise Invalid("the drafter is dflash2, mtp, off or auto")
     v = v or verified()
     old = drafting_of(p)
     stash = p.setdefault("drafter_options", {})
@@ -320,6 +326,36 @@ def _route_prior_put(p: dict, text: str) -> None:
     if not 0 <= x <= 2.0:
         raise Invalid("STRATA_ROUTE_PRIOR must be 0-2.0 (0 = off; owner range)")
     p.setdefault("env", {})["STRATA_ROUTE_PRIOR"] = f"{x:g}"
+
+
+def set_df2_gate(p: dict, text: str) -> None:
+    """STRATA_DF2_GATE: on writes "1" (the engine reads a leading '1', include/strata/spec/window_rule.hpp), off removes it."""
+    env = p.setdefault("env", {})
+    if _onoff(text, "STRATA_DF2_GATE"):
+        env["STRATA_DF2_GATE"] = "1"
+    else:
+        env.pop("STRATA_DF2_GATE", None)
+
+
+def tuned_pack_status(p: dict) -> str:
+    """Whether Strata's tuned DFlash2 pack can apply to this profile's model on a CUDA card, and whether the file is here.
+    Read from the installed Strata (strata_control/drafting.py); "unknown" when that Strata has no tuned drafter."""
+    try:
+        from strata_control import drafting as D
+    except Exception:  # noqa: BLE001 - no Strata on the path
+        return "unknown"
+    try:
+        model = p.get("model_name") or ""
+        key = model[len(D.MODEL_PREFIX):] if model.startswith(D.MODEL_PREFIX) else model
+        entries = [e for k, e in D.SET_DEFAULTS.items() if k[:2] == ("cuda", key) and e.tuned]
+        classes = [(k[2], e) for k, e in D.CLASS_DEFAULTS.items() if k[:2] == ("cuda", key) and e.tuned]
+        where = sorted({e.where or "every card" for e in entries} | {c for c, _ in classes})
+        data_dir = D.data_dir_of(P.engine_argv(p, Path(".")))
+        here = bool(data_dir) and D.tuned_ok(data_dir)
+    except Exception:  # noqa: BLE001 - another Strata version: say so instead of failing the menu
+        return "unknown"
+    use = ("for this model on: " + ", ".join(where)) if where else "not for this model"
+    return f"{use}; file {'downloaded' if here else 'not downloaded'}"
 
 
 # --- refusal vector
@@ -420,9 +456,21 @@ ITEMS: list[Item] = [
          when=lambda p: vision_mode(p) != "off", restore=_copy_key(("vision", "max_tokens"))),
     # 3 speculative decoding
     Item("drafting", "3 Drafting", "drafter",
-         "How the next tokens are guessed. dflash2 = the block drafter; mtp = the model's own draft layer (options from Strata setup's defaults, not verified on this PC); off = no drafter (prompt lookup still runs).",
-         drafting_of, lambda p, t: set_drafting(p, t), choices=("dflash2", "mtp", "off"),
+         "How the next tokens are guessed. dflash2 = the block drafter; mtp = the model's own draft layer (options from Strata setup's defaults, not verified on this PC); off = no drafter (prompt lookup still runs); "
+         "auto = Strata picks per model and card class, with its own window and confidence (0.1.58 on a 12 GB card: IQ3_S -> MTP, UD-IQ4_XS-v31 -> DFlash2 + tuned pack, others -> DFlash2).",
+         drafting_of, lambda p, t: set_drafting(p, t), choices=("dflash2", "mtp", "off", "auto"),
          restore=lambda p, v: set_drafting(p, drafting_of(v), v)),
+    Item("df2_gate", "3 Drafting", "STRATA_DF2_GATE",
+         "DFlash2's window from each request's own measured hit rate instead of the fixed --draft-conf (new in 0.1.58, opt-in; Strata measured it on a Mac only). "
+         "May lengthen windows where guesses keep landing and shorten them where they do not.",
+         lambda p: "on" if (p.get("env") or {}).get("STRATA_DF2_GATE", "").startswith("1") else "off", lambda p, t: set_df2_gate(p, t),
+         choices=("off", "on"), when=lambda p: drafting_of(p) in ("dflash2", "auto"),
+         restore=_copy_key(("env", "STRATA_DF2_GATE"))),
+    Item("tuned_pack", "3 Drafting", "tuned drafter pack",
+         "Strata's fine-tuned DFlash2 drafter (0.1.58, +11% accepted drafts on the 4-bit Unsloth sets). Strata itself uses it where the model and card class have an entry and the file "
+         "is downloaded (`strata drafting fetch`); a profile cannot force it.",
+         lambda p: tuned_pack_status(p), when=lambda p: drafting_of(p) in ("dflash2", "auto"),
+         locked="Shown only: Strata chooses the tuned pack itself (drafting.py SET_DEFAULTS / CLASS_DEFAULTS)."),
     Item("draft_model", "3 Drafting", "--draft-model",
          "The DFlash2 drafter file.", lambda p: get_flag(p, "--draft-model") or "(not set)", when=_is("dflash2"),
          locked="With dflash2, Strata picks the drafter pack from the data folder itself (drafting.py pack_path) and replaces any value set here; the live line checks the pack really used after the start."),
@@ -431,7 +479,7 @@ ITEMS: list[Item] = [
                check=_check_file("--mtp-draft-vocab"), when=_is("dflash2")),
     _flag_item("spec", "3 Drafting", "--spec",
                "The most tokens guessed per verify round. Larger is faster when guesses land and wastes more work when they miss.",
-               choices=("4", "6", "8"), free=True, hint="2-8", check=_check_spec, when=lambda p: drafting_of(p) != "off"),
+               choices=("4", "6", "8"), free=True, hint="2-8", check=_check_spec, when=lambda p: drafting_of(p) in ("dflash2", "mtp")),
     _flag_item("draft_conf", "3 Drafting", "--draft-conf",
                "DFlash2's confidence cutoff: the window ends where the guesses' combined probability falls below it. High = short windows, more hits; low = long windows, more wasted work. 0 = use --spec-min-p.",
                choices=("0.35", "0.5", "0.8"), free=True, hint="0-1", check=_check_conf, when=_is("dflash2")),
@@ -531,7 +579,7 @@ def same(a: dict, b: dict) -> bool:
 TITLES = {
     "max_context": "Context length", "kv": "KV precision", "kv_resident": "KV kept in VRAM", "kv_grow": "KV grows on demand",
     "prefill": "Prompt chunk size", "vision": "Images", "vision_device": "Image reader on", "vision_tokens": "Tokens per image",
-    "drafting": "Drafter", "draft_model": "DFlash2 pack", "mtp_draft_vocab": "Draft vocabulary", "spec": "Draft window",
+    "drafting": "Drafter", "df2_gate": "Adaptive DFlash2 window", "tuned_pack": "Tuned drafter pack", "draft_model": "DFlash2 pack", "mtp_draft_vocab": "Draft vocabulary", "spec": "Draft window",
     "draft_conf": "DFlash2 confidence", "draft_fallback": "Fallback drafter", "spec_min_p": "MTP confidence",
     "vram_reserve": "VRAM reserve", "expert_cache": "Experts in VRAM", "route_prior": "Prefer cached experts",
     "refusal": "Refusal vector", "refusal_vector": "Vector file", "refusal_scale": "Strength", "refusal_layers": "Layers",

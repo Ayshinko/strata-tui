@@ -135,6 +135,41 @@ class Drafting(unittest.TestCase):
         self.assertEqual(L.compare_args(v["args"], S.restore(item("drafting"), mtp, v)["args"]), [])   # same options (order may differ)
 
 
+class NewDraftOptions(unittest.TestCase):
+    def test_df2_gate_toggle(self):
+        v = S.verified()
+        on = S.apply(item("df2_gate"), v, "on")
+        self.assertEqual(on["env"]["STRATA_DF2_GATE"], "1")
+        self.assertEqual(item("df2_gate").get(on), "on")
+        off = S.apply(item("df2_gate"), on, "off")
+        self.assertNotIn("STRATA_DF2_GATE", off["env"])
+        self.assertEqual(S.changed_items(S.restore(item("df2_gate"), on, v), v), [])
+        mtp = S.apply(item("drafting"), v, "mtp")
+        self.assertFalse(item("df2_gate").when(mtp))      # only shown for dflash2 / auto
+
+    def test_auto_leaves_the_drafter_to_strata(self):
+        v = S.verified()
+        auto = S.apply(item("drafting"), v, "auto")
+        self.assertEqual(auto["drafting"], "auto")
+        self.assertTrue(S.has_flag(auto, "--mtp"))        # the layer folder Strata needs for either drafter
+        with tempfile.TemporaryDirectory() as d:
+            cfg = P.run_config(auto, strata_root=Path(d), components=Path(d), log_path=Path(d) / "e.log")
+        kept = {g[0] for g in P.groups(cfg["user_args"])}
+        self.assertFalse(kept & set(P.DRAFTER_OWNED))
+        self.assertIn("--max-context", kept)
+        for key in ("spec", "draft_conf", "spec_min_p"):
+            self.assertFalse(item(key).when(auto), key)
+        back = S.apply(item("drafting"), auto, "dflash2")
+        self.assertEqual(L.compare_args(v["args"], back["args"]), [])
+
+    def test_tuned_pack_is_shown_only(self):
+        v = S.verified()
+        with self.assertRaises(S.Invalid):
+            S.apply(item("tuned_pack"), v, "x")
+        self.assertIsInstance(item("tuned_pack").get(v), str)
+        self.assertIn("tuned_pack", S.TITLES)
+
+
 class StrataKeepsTheSettings(unittest.TestCase):
     """Edited profiles through Strata's own start logic: the engine options must be the profile's (except what Strata owns)."""
 
@@ -157,6 +192,7 @@ class StrataKeepsTheSettings(unittest.TestCase):
         exe = str(folder / ("strata.exe" if os.name == "nt" else "strata"))
         v = S.verified()
         cases = {"mtp": S.apply(item("drafting"), v, "mtp"), "off": S.apply(item("drafting"), v, "off"),
+                 "gate": S.apply(item("df2_gate"), v, "on"),
                  "edited": S.apply(item("kv_grow"), S.apply(item("kv_resident"), S.apply(item("draft_conf"),
                                                      S.apply(item("max_context"), v, "131072"), "0.5"), "0"), "on")}
         for name, prof in cases.items():
